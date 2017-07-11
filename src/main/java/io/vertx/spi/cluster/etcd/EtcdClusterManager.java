@@ -10,6 +10,8 @@ import com.coreos.jetcd.api.LeaseGrantResponse;
 import com.coreos.jetcd.api.LeaseGrpc;
 import com.coreos.jetcd.api.LeaseKeepAliveRequest;
 import com.coreos.jetcd.api.LeaseKeepAliveResponse;
+import com.coreos.jetcd.api.LeaseRevokeRequest;
+import com.coreos.jetcd.api.LeaseRevokeResponse;
 import com.coreos.jetcd.api.PutRequest;
 import com.coreos.jetcd.api.PutResponse;
 
@@ -70,7 +72,9 @@ public class EtcdClusterManager implements ClusterManager {
 
   private static final String ETCD_CLUSTER_NODES = "cluster/nodes";
 
-  private static final long ETCD_TIMEOUT = 5000l;
+  private static final long ETCD_TIMEOUT = 5l;
+
+  private long sharedLease;
 
   public EtcdClusterManager(String host, int port) {
     this(host, port, "vertx");
@@ -105,7 +109,7 @@ public class EtcdClusterManager implements ClusterManager {
 
   @Override
   public <K, V> Map<K, V> getSyncMap(String name) {
-    return new EtcdSyncMapImpl(prefix + "/" + name, channel);
+    return new EtcdSyncMapImpl(prefix + "/" + name, sharedLease, channel);
   }
 
   @Override
@@ -136,6 +140,7 @@ public class EtcdClusterManager implements ClusterManager {
 
   @Override
   public void join(Handler<AsyncResult<Void>> handler) {
+
     channel = buildChannel();
 
     leaseStub = LeaseGrpc.newVertxStub(channel);
@@ -152,13 +157,14 @@ public class EtcdClusterManager implements ClusterManager {
           grantFuture)
       )
       .map(LeaseGrantResponse::getID)
+      .map((lease) -> sharedLease = lease)
       .<Void>compose(lease ->
         Future.<PutResponse>future(putFuture ->
           kvStub.put(
             PutRequest.newBuilder()
-              .setLease(lease)
+              .setLease(sharedLease)
               .setKey(key())
-              .setValue(value())
+              .setValue(ByteString.EMPTY)
               .build(),
             putFuture)
         )
@@ -176,10 +182,10 @@ public class EtcdClusterManager implements ClusterManager {
   public void leave(Handler<AsyncResult<Void>> handler) {
     vertx.cancelTimer(keepAlivePeriodic);
     Future
-      .<DeleteRangeResponse>future(future ->
-        kvStub.deleteRange(
-          DeleteRangeRequest.newBuilder()
-            .setKey(key())
+      .<LeaseRevokeResponse>future(future ->
+        leaseStub.leaseRevoke(
+          LeaseRevokeRequest.newBuilder()
+            .setID(sharedLease)
             .build(),
           future
         )
@@ -198,6 +204,7 @@ public class EtcdClusterManager implements ClusterManager {
     Context context = vertx.getOrCreateContext();
     NioEventLoopGroup eventLoopGroup = new NioEventLoopGroup(1,
       (ThreadFactory) (r) -> new Thread(r, "vertx-etcd-eventloop"));
+    eventLoopGroup.execute(() -> {});  // a little magic, force the nio thread to be created
     return NettyChannelBuilder.forAddress(host, port)
       .eventLoopGroup(eventLoopGroup)
       .usePlaintext(true)
@@ -217,10 +224,6 @@ public class EtcdClusterManager implements ClusterManager {
 
   private ByteString key() {
     return ByteString.copyFromUtf8(prefix + "/" + ETCD_CLUSTER_NODES + "/" + nodeId);
-  }
-
-  private ByteString value() {
-    return ByteString.copyFromUtf8(nodeId);
   }
 
 }

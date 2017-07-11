@@ -25,10 +25,13 @@ public class EtcdSyncMapImpl<K, V> implements Map<K, V> {
 
   private String name;
 
+  private long sharedLease;
+
   private KVGrpc.KVBlockingStub kvStub;
 
-  public EtcdSyncMapImpl(String name, ManagedChannel channel) {
+  public EtcdSyncMapImpl(String name, long sharedLease, ManagedChannel channel) {
     this.name = name;
+    this.sharedLease = sharedLease;
     kvStub = KVGrpc.newBlockingStub(channel);
   }
 
@@ -94,6 +97,7 @@ public class EtcdSyncMapImpl<K, V> implements Map<K, V> {
       PutRequest.newBuilder()
         .setKey(ByteString.copyFromUtf8(name + "/" + key.toString()))
         .setValue(toByteString(value))
+        .setLease(sharedLease)
         .setPrevKv(true)
         .build())
       .getPrevKv().getValue());
@@ -114,8 +118,8 @@ public class EtcdSyncMapImpl<K, V> implements Map<K, V> {
   }
 
   @Override
-  public void putAll(Map<? extends K, ? extends V> m) {
-    m.forEach(this::put);
+  public void putAll(Map<? extends K, ? extends V> map) {
+    map.forEach(this::put);
   }
 
   @Override
