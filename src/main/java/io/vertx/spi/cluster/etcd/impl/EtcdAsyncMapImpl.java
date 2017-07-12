@@ -36,14 +36,11 @@ public class EtcdAsyncMapImpl<K, V> implements AsyncMap<K, V> {
 
   private LeaseGrpc.LeaseVertxStub leaseStub;
 
-  private String name;
-
   private ByteString rangeBegin, rangeEnd;
 
   public EtcdAsyncMapImpl(String name, ManagedChannel channel) {
     this.kvStub = KVGrpc.newVertxStub(channel);
     this.leaseStub = LeaseGrpc.newVertxStub(channel);
-    this.name = name;
     rangeBegin = ByteString.copyFromUtf8(name + "/");
     rangeEnd = ByteString.copyFromUtf8(name + "0"); // '0' is the next char of '/'
   }
@@ -88,7 +85,7 @@ public class EtcdAsyncMapImpl<K, V> implements AsyncMap<K, V> {
       .<LeaseGrantResponse>future(grantFuture ->
         leaseStub.leaseGrant(
           LeaseGrantRequest.newBuilder()
-            .setTTL(ttl / 1000) // cast ms to sec
+            .setTTL(castToSeconds(ttl)) // cast ms to sec
             .build(),
           grantFuture)
       )
@@ -147,7 +144,7 @@ public class EtcdAsyncMapImpl<K, V> implements AsyncMap<K, V> {
       .<LeaseGrantResponse>future(grantFuture ->
         leaseStub.leaseGrant(
           LeaseGrantRequest.newBuilder()
-            .setTTL(ttl / 1000) // cast ms to sec
+            .setTTL(castToSeconds(ttl)) // cast ms to sec
             .build(),
           grantFuture)
       )
@@ -165,7 +162,8 @@ public class EtcdAsyncMapImpl<K, V> implements AsyncMap<K, V> {
               .addSuccess(RequestOp.newBuilder()
                 .setRequestPut(PutRequest.newBuilder()
                   .setKey(keyPath(k))
-                  .setValue(toByteString(v)))
+                  .setValue(toByteString(v))
+                  .setLease(lease))
               )
               .addFailure(RequestOp.newBuilder()
                 .setRequestRange(RangeRequest.newBuilder()
@@ -312,6 +310,10 @@ public class EtcdAsyncMapImpl<K, V> implements AsyncMap<K, V> {
 
   private ByteString keyPath(K key) {
     return rangeBegin.concat(toByteString(key));
+  }
+
+  private long castToSeconds(long ttl) {
+    return ttl / 1000 + ttl % 1000 == 0 ? 0 : 1;
   }
 
 }

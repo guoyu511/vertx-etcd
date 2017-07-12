@@ -6,7 +6,7 @@ import io.vertx.spi.cluster.etcd.EtcdClusterManager;
 /**
  * @author <a href="mailto:guoyu.511@gmail.com">Guo Yu</a>
  */
-public class EtcdClusterWideMapTest extends ClusterWideMapTest {
+public class EtcdAsynchronousLockTest extends ClusteredAsynchronousLockTest {
 
   @Override
   protected ClusterManager getClusterManager() {

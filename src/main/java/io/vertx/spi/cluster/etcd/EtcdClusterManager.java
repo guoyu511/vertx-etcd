@@ -2,8 +2,6 @@ package io.vertx.spi.cluster.etcd;
 
 import com.google.protobuf.ByteString;
 
-import com.coreos.jetcd.api.DeleteRangeRequest;
-import com.coreos.jetcd.api.DeleteRangeResponse;
 import com.coreos.jetcd.api.KVGrpc;
 import com.coreos.jetcd.api.LeaseGrantRequest;
 import com.coreos.jetcd.api.LeaseGrantResponse;
@@ -37,9 +35,11 @@ import io.vertx.core.spi.cluster.AsyncMultiMap;
 import io.vertx.core.spi.cluster.ClusterManager;
 import io.vertx.core.spi.cluster.NodeListener;
 import io.vertx.grpc.GrpcBidiExchange;
+import io.vertx.grpc.VertxChannelBuilder;
 import io.vertx.spi.cluster.etcd.impl.EtcdAsyncMapImpl;
 import io.vertx.spi.cluster.etcd.impl.EtcdAsyncMultiMapImpl;
 import io.vertx.spi.cluster.etcd.impl.EtcdSyncMapImpl;
+import io.vertx.spi.cluster.etcd.impl.LockImpl;
 
 /**
  * @author <a href="mailto:guoyu.511@gmail.com">Guo Yu</a>
@@ -52,8 +52,6 @@ public class EtcdClusterManager implements ClusterManager {
 
   private String prefix;
 
-  private Map<String, String> nodeCache = new HashMap<>();
-
   private Vertx vertx;
 
   private ManagedChannel channel;
@@ -64,17 +62,19 @@ public class EtcdClusterManager implements ClusterManager {
 
   private LeaseGrpc.LeaseVertxStub leaseStub;
 
+  private Map<String, String> nodeCache = new HashMap<>();
+
   private long keepAlivePeriodic;
 
-  private boolean active;
+  private volatile boolean active;
 
-  private String nodeId;
+  private volatile String nodeId;
+
+  private volatile long sharedLease;
 
   private static final String ETCD_CLUSTER_NODES = "cluster/nodes";
 
   private static final long ETCD_TIMEOUT = 5l;
-
-  private long sharedLease;
 
   public EtcdClusterManager(String host, int port) {
     this(host, port, "vertx");
@@ -114,7 +114,8 @@ public class EtcdClusterManager implements ClusterManager {
 
   @Override
   public void getLockWithTimeout(String name, long timeout, Handler<AsyncResult<Lock>> resultHandler) {
-    System.out.println("getLockWithTimeout");
+    LockImpl lock = new LockImpl(name, timeout, sharedLease, channel, vertx);
+    lock.aquire(resultHandler);
   }
 
   @Override
@@ -141,6 +142,7 @@ public class EtcdClusterManager implements ClusterManager {
   @Override
   public void join(Handler<AsyncResult<Void>> handler) {
 
+    //channel = buildChannel();
     channel = buildChannel();
 
     leaseStub = LeaseGrpc.newVertxStub(channel);
@@ -158,8 +160,8 @@ public class EtcdClusterManager implements ClusterManager {
       )
       .map(LeaseGrantResponse::getID)
       .map((lease) -> sharedLease = lease)
-      .<Void>compose(lease ->
-        Future.<PutResponse>future(putFuture ->
+      .<PutResponse>compose(lease ->
+        Future.future(putFuture ->
           kvStub.put(
             PutRequest.newBuilder()
               .setLease(sharedLease)
@@ -168,13 +170,13 @@ public class EtcdClusterManager implements ClusterManager {
               .build(),
             putFuture)
         )
-        .map((res) -> {
-          leaseStub.leaseKeepAlive((exchange) ->
-            this.keepAlive(lease, exchange));
-          active = true;
-          return null;
-        })
       )
+      .<Void>map((res) -> {
+        leaseStub.leaseKeepAlive((exchange) ->
+          this.keepAlive(sharedLease, exchange));
+        active = true;
+        return null;
+      })
       .setHandler(handler);
   }
 
