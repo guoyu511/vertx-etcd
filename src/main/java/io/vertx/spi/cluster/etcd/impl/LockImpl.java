@@ -79,10 +79,15 @@ public class LockImpl implements Lock {
   private void tryAquire() {
     compareAndSet()
       .setHandler(ar -> {
+        if (ar.failed()) {
+          handler.handle(Future.failedFuture(ar.cause()));
+          return;
+        }
         if (ar.result()) {
           handler.handle(Future.succeededFuture(this));
+          return;
         }
-        waitTimeout();
+        startWatch();
       });
   }
 
@@ -105,17 +110,27 @@ public class LockImpl implements Lock {
           .build(),
         txnFuture)
       )
-      .map(TxnResponse::getSucceeded)
-      .otherwise(false);
+      .map(TxnResponse::getSucceeded);
   }
 
-  private void waitTimeout() {
+  private void startWatch() {
     watchExchange.write(
       WatchRequest.newBuilder()
         .setCreateRequest(WatchCreateRequest.newBuilder().setKey(key))
         .build());
     //TODO reduce timeout
     timeoutTimer = vertx.setTimer(timeout, (ignore) -> timeout());
+  }
+
+  private void cancelWatch() {
+    watchExchange
+      .write(WatchRequest.newBuilder()
+        .setCancelRequest(
+          WatchCancelRequest.newBuilder()
+            .setWatchId(watchId)
+        )
+        .build());
+    vertx.cancelTimer(timeoutTimer);
   }
 
   private void handleWatchResponse(WatchResponse response) {
@@ -129,18 +144,12 @@ public class LockImpl implements Lock {
     if (response.getEvents(0).getType() != Event.EventType.DELETE) {
       return;
     }
-    vertx.cancelTimer(timeoutTimer);
+    cancelWatch();
     tryAquire();
   }
 
   private void timeout() {
-    watchExchange
-      .write(WatchRequest.newBuilder()
-        .setCancelRequest(
-          WatchCancelRequest.newBuilder()
-            .setWatchId(watchId)
-        )
-        .build());
+    cancelWatch();
     handler.handle(Future.failedFuture(
       new VertxException("Lock aquire timeout:" + key.toStringUtf8())));
   }

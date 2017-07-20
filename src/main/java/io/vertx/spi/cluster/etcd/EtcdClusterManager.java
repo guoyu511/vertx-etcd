@@ -17,6 +17,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ThreadFactory;
 import java.util.stream.Collectors;
 
@@ -54,7 +55,7 @@ public class EtcdClusterManager implements ClusterManager {
 
   private Vertx vertx;
 
-  private ManagedChannel channel;
+  private ManagedChannel channelForSyncMap;
 
   private NodeListener listener;
 
@@ -71,6 +72,8 @@ public class EtcdClusterManager implements ClusterManager {
   private volatile String nodeId;
 
   private volatile long sharedLease;
+
+  private ConcurrentHashMap<Context, ManagedChannel> channelMap = new ConcurrentHashMap<>();
 
   private static final String ETCD_CLUSTER_NODES = "cluster/nodes";
 
@@ -95,7 +98,7 @@ public class EtcdClusterManager implements ClusterManager {
   public <K, V> void getAsyncMultiMap(String name, Handler<AsyncResult<AsyncMultiMap<K, V>>> asyncResultHandler) {
     vertx.runOnContext((ignore) ->
       asyncResultHandler.handle(Future.succeededFuture(
-        new EtcdAsyncMultiMapImpl<>(prefix + "/" + name, channel)))
+        new EtcdAsyncMultiMapImpl<>(prefix + "/" + name, getChannel())))
     );
   }
 
@@ -103,19 +106,21 @@ public class EtcdClusterManager implements ClusterManager {
   public <K, V> void getAsyncMap(String name, Handler<AsyncResult<AsyncMap<K, V>>> asyncResultHandler) {
     vertx.runOnContext((ignore) ->
       asyncResultHandler.handle(Future.succeededFuture(
-        new EtcdAsyncMapImpl<>(prefix + "/" + name, channel)))
+        new EtcdAsyncMapImpl<>(prefix + "/" + name, getChannel())))
     );
   }
 
   @Override
   public <K, V> Map<K, V> getSyncMap(String name) {
-    return new EtcdSyncMapImpl(prefix + "/" + name, sharedLease, channel);
+    return new EtcdSyncMapImpl(prefix + "/" + name, sharedLease, channelForSyncMap);
   }
 
   @Override
   public void getLockWithTimeout(String name, long timeout, Handler<AsyncResult<Lock>> resultHandler) {
-    LockImpl lock = new LockImpl(name, timeout, sharedLease, channel, vertx);
-    lock.aquire(resultHandler);
+    vertx.runOnContext((ignore) -> {
+      LockImpl lock = new LockImpl(name, timeout, sharedLease, getChannel(), vertx);
+      lock.aquire(resultHandler);
+    });
   }
 
   @Override
@@ -142,11 +147,10 @@ public class EtcdClusterManager implements ClusterManager {
   @Override
   public void join(Handler<AsyncResult<Void>> handler) {
 
-    //channel = buildChannel();
-    channel = buildChannel();
+    channelForSyncMap = buildChannelForSyncMap();
 
-    leaseStub = LeaseGrpc.newVertxStub(channel);
-    kvStub = KVGrpc.newVertxStub(channel);
+    leaseStub = LeaseGrpc.newVertxStub(getChannel());
+    kvStub = KVGrpc.newVertxStub(getChannel());
 
     nodeId = UUID.randomUUID().toString();
 
@@ -192,7 +196,11 @@ public class EtcdClusterManager implements ClusterManager {
           future
         )
       )
-      .map((Void)null)
+      .<Void>map((res) -> {
+        channelForSyncMap.shutdownNow();
+        channelMap.values().forEach(ManagedChannel::shutdownNow);
+        return null;
+      })
       .setHandler(handler);
   }
 
@@ -201,18 +209,31 @@ public class EtcdClusterManager implements ClusterManager {
     return active;
   }
 
-  private ManagedChannel buildChannel() {
+  private ManagedChannel getChannel() {
+    return channelMap.computeIfAbsent(
+      vertx.getOrCreateContext(),
+      (ctx) -> {
+        ManagedChannel channel = VertxChannelBuilder.forAddress(vertx, host, port)
+          .usePlaintext(true)
+          .build();
+        ctx.addCloseHook(handler -> {
+          channel.shutdown();
+          channelMap.remove(ctx);
+          handler.handle(Future.succeededFuture());
+        });
+        return channel;
+      }
+    );
+  }
+
+  private ManagedChannel buildChannelForSyncMap() {
     //use split nio event loop because we need perform blocking operator on eventloop thread for syncMap
-    Context context = vertx.getOrCreateContext();
     NioEventLoopGroup eventLoopGroup = new NioEventLoopGroup(1,
       (ThreadFactory) (r) -> new Thread(r, "vertx-etcd-eventloop"));
     eventLoopGroup.execute(() -> {});  // a little magic, force the nio thread to be created
     return NettyChannelBuilder.forAddress(host, port)
       .eventLoopGroup(eventLoopGroup)
       .usePlaintext(true)
-      .executor((runnable) ->
-        context.runOnContext((ignore) -> runnable.run())
-      )
       .build();
   }
 
