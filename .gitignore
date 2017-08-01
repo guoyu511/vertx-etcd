@@ -6,4 +6,3 @@
 !src/**
 !pom.xml
 !README.md
-src/main/java/com/coreos/jetcd/api
