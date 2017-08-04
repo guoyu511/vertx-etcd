@@ -226,6 +226,9 @@ public class EtcdClusterManager implements ClusterManager {
       watchRes.getEventsList().forEach(event -> {
         KeyValue kv = event.getKv();
         String nodeId = kv.getValue().toStringUtf8();
+        if (nodeId.equals(EtcdClusterManager.this.nodeId)) {
+          return;
+        }
         if (event.getType() == Event.EventType.PUT) {
           nodeCache.put(kv.getKey().toStringUtf8(), nodeId);
           if (nodeListener != null) {

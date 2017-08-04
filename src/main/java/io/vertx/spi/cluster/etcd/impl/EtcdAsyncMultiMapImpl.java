@@ -42,8 +42,8 @@ public class EtcdAsyncMultiMapImpl<K, V> implements AsyncMultiMap<K, V> {
     this.vertx = vertx;
     this.name = name;
     this.kvStub = KVGrpc.newBlockingStub(channel);
-    rangeBegin = ByteString.copyFromUtf8(name + "/");
-    rangeEnd = ByteString.copyFromUtf8(name + "0");
+    rangeBegin = toByteString(name + "/");
+    rangeEnd = toByteString(name + "0");
   }
 
   @Override
@@ -51,7 +51,11 @@ public class EtcdAsyncMultiMapImpl<K, V> implements AsyncMultiMap<K, V> {
     vertx.executeBlocking(future -> {
       kvStub.put(
         PutRequest.newBuilder()
-          .setKey(keyValuePath(k, v))
+          .setKey(rangeBegin
+            .concat(toByteString(k))
+            .concat(toByteString("/"))
+            .concat(toByteString(v))
+          )
           .setValue(toByteString(v))
           .build());
       future.complete();
@@ -63,12 +67,14 @@ public class EtcdAsyncMultiMapImpl<K, V> implements AsyncMultiMap<K, V> {
     vertx.executeBlocking(future -> {
       RangeResponse rangeRes = kvStub.range(
         RangeRequest.newBuilder()
-          .setKey(
-            ByteString.copyFromUtf8(name + "/" + k.toString() + "/")
-          )
-          .setRangeEnd(
-            ByteString.copyFromUtf8(name + "/" + k.toString() + "0")
-          )
+          .setKey(rangeBegin
+            .concat(toByteString(k)
+            .concat(toByteString("/"))
+          ))
+          .setRangeEnd(rangeBegin
+            .concat(toByteString(k)
+            .concat(toByteString("0"))
+          ))
           .build());
       future.complete(new KeyValueIterable<>(rangeRes));
     }, handler);
@@ -79,8 +85,11 @@ public class EtcdAsyncMultiMapImpl<K, V> implements AsyncMultiMap<K, V> {
     vertx.executeBlocking(future -> {
       DeleteRangeResponse deleteRes = kvStub.deleteRange(
         DeleteRangeRequest.newBuilder()
-          .setKey(ByteString
-            .copyFromUtf8(name + "/" + k.toString() + "/" + v.toString()))
+          .setKey(rangeBegin
+            .concat(toByteString(k)
+            .concat(toByteString("/"))
+            .concat(toByteString(v))
+          ))
           .build()
       );
       future.complete(deleteRes.getDeleted() > 0);
@@ -114,13 +123,6 @@ public class EtcdAsyncMultiMapImpl<K, V> implements AsyncMultiMap<K, V> {
       future.complete();
     }, handler);
   }
-
-  private ByteString keyValuePath(K key, V value) {
-    return rangeBegin.concat(toByteString(
-      key.toString() + "/" + value.toString()
-    ));
-  }
-
 
   private static class KeyValueIterable<V> implements ChoosableIterable<V> {
 
