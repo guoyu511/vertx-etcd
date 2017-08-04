@@ -100,10 +100,11 @@ public class EtcdClusterManager implements ClusterManager {
 
   @Override
   public <K, V> void getAsyncMultiMap(String name, Handler<AsyncResult<AsyncMultiMap<K, V>>> asyncResultHandler) {
-    vertx.runOnContext((ignore) ->
+    vertx.runOnContext((ignore) -> {
+      long lease = name.equals("__vertx.subs") ? sharedLease : 0;
       asyncResultHandler.handle(Future.succeededFuture(
-        new EtcdAsyncMultiMapImpl<>(prefix + "/maps/" + name, managedChannel, vertx)))
-    );
+        new EtcdAsyncMultiMapImpl<>(prefix + "/maps/" + name, lease, managedChannel, vertx)));
+    });
   }
 
   @Override
@@ -190,6 +191,7 @@ public class EtcdClusterManager implements ClusterManager {
         .build());
       managedChannel.shutdown();
       grpcEventLoop.shutdownGracefully();
+      active = false;
       future.complete();
     }, handler);
   }

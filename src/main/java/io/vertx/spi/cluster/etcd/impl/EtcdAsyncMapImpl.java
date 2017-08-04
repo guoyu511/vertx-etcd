@@ -36,14 +36,14 @@ public class EtcdAsyncMapImpl<K, V> implements AsyncMap<K, V> {
 
   private LeaseGrpc.LeaseBlockingStub leaseStub;
 
-  private ByteString rangeBegin, rangeEnd;
+  private String rangeBegin, rangeEnd;
 
   public EtcdAsyncMapImpl(String name, ManagedChannel channel, Vertx vertx) {
     this.vertx = vertx;
     this.kvStub = KVGrpc.newBlockingStub(channel);
     this.leaseStub = LeaseGrpc.newBlockingStub(channel);
-    rangeBegin = ByteString.copyFromUtf8(name + "/");
-    rangeEnd = ByteString.copyFromUtf8(name + "0"); // '0' is the next char of '/'
+    rangeBegin = name + "/";
+    rangeEnd = name + "0"; // '0' is the next char of '/'
   }
 
   @Override
@@ -59,7 +59,7 @@ public class EtcdAsyncMapImpl<K, V> implements AsyncMap<K, V> {
           fromByteString(res.getKvs(0).getValue())
         );
       }
-    }, handler);
+    }, false, handler);
   }
 
   @Override
@@ -71,7 +71,7 @@ public class EtcdAsyncMapImpl<K, V> implements AsyncMap<K, V> {
           .setValue(toByteString(v))
           .build());
       future.complete();
-    }, handler);
+    }, false, handler);
   }
 
   @Override
@@ -87,7 +87,7 @@ public class EtcdAsyncMapImpl<K, V> implements AsyncMap<K, V> {
           .setLease(leaseRes.getID())
           .build());
       future.complete();
-    }, handler);
+    }, false, handler);
   }
 
   @Override
@@ -119,7 +119,7 @@ public class EtcdAsyncMapImpl<K, V> implements AsyncMap<K, V> {
             .getResponseRange().getKvs(0).getValue())
         );
       }
-    }, handler);
+    }, false, handler);
   }
 
   @Override
@@ -155,7 +155,7 @@ public class EtcdAsyncMapImpl<K, V> implements AsyncMap<K, V> {
             .getResponseRange().getKvs(0).getValue())
         );
       }
-    }, handler);
+    }, false, handler);
   }
 
   @Override
@@ -173,7 +173,7 @@ public class EtcdAsyncMapImpl<K, V> implements AsyncMap<K, V> {
           fromByteString(deleteRes.getPrevKvs(0).getValue())
         );
       }
-    }, handler);
+    }, false, handler);
   }
 
   @Override
@@ -193,7 +193,7 @@ public class EtcdAsyncMapImpl<K, V> implements AsyncMap<K, V> {
           )
           .build());
       future.complete(txnRes.getSucceeded());
-    }, handler);
+    }, false, handler);
   }
 
   @Override
@@ -223,7 +223,7 @@ public class EtcdAsyncMapImpl<K, V> implements AsyncMap<K, V> {
             .getResponsePut().getPrevKv().getValue())
         );
       }
-    }, handler);
+    }, false, handler);
   }
 
   @Override
@@ -245,7 +245,7 @@ public class EtcdAsyncMapImpl<K, V> implements AsyncMap<K, V> {
           .build()
       );
       future.complete(txnRes.getSucceeded());
-    }, handler);
+    }, false, handler);
   }
 
   @Override
@@ -253,11 +253,11 @@ public class EtcdAsyncMapImpl<K, V> implements AsyncMap<K, V> {
     vertx.executeBlocking(future -> {
       kvStub.deleteRange(
         DeleteRangeRequest.newBuilder()
-          .setKey(rangeBegin)
-          .setRangeEnd(rangeEnd)
+          .setKey(ByteString.copyFromUtf8(rangeBegin))
+          .setRangeEnd(ByteString.copyFromUtf8(rangeEnd))
           .build());
       future.complete();
-    }, handler);
+    }, false, handler);
   }
 
   @Override
@@ -265,15 +265,15 @@ public class EtcdAsyncMapImpl<K, V> implements AsyncMap<K, V> {
     vertx.executeBlocking(future -> {
       RangeResponse rangeRes = kvStub.range(
         RangeRequest.newBuilder()
-          .setKey(rangeBegin)
-          .setRangeEnd(rangeEnd)
+          .setKey(ByteString.copyFromUtf8(rangeBegin))
+          .setRangeEnd(ByteString.copyFromUtf8(rangeEnd))
           .build());
       future.complete(rangeRes.getKvsCount());
-    }, handler);
+    }, false, handler);
   }
 
   private ByteString keyPath(K key) {
-    return rangeBegin.concat(toByteString(key));
+    return ByteString.copyFromUtf8(rangeBegin + key);
   }
 
   private long castToSeconds(long ttl) {

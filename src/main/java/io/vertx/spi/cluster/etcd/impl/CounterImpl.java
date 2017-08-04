@@ -39,9 +39,9 @@ public class CounterImpl implements Counter {
 
   public CounterImpl(String name, long sharedLease, ManagedChannel channel, Vertx vertx) {
     this.vertx = vertx;
-    kvStub = KVGrpc.newBlockingStub(channel);
-    this.key = ByteString.copyFromUtf8(name);
     this.sharedLease = sharedLease;
+    this.key = ByteString.copyFromUtf8(name);
+    kvStub = KVGrpc.newBlockingStub(channel);
   }
 
   @Override
@@ -58,7 +58,7 @@ public class CounterImpl implements Counter {
           fromByteString(rangeRes.getKvs(0).getValue())
         );
       }
-    }, resultHandler);
+    }, false, resultHandler);
   }
 
   @Override
@@ -88,7 +88,7 @@ public class CounterImpl implements Counter {
       } else {
         future.complete(fromByteString(rangeRes.getKvs(0).getValue()));
       }
-    }, (ar) -> {
+    }, false, (ar) -> {
       if (ar.failed()) {
         resultHandler.handle(Future.failedFuture(ar.cause()));
         return;
@@ -119,7 +119,7 @@ public class CounterImpl implements Counter {
       } else {
         future.complete(fromByteString(rangeRes.getKvs(0).getValue()));
       }
-    }, (ar) -> {
+    }, false, (ar) -> {
       if (ar.failed()) {
         resultHandler.handle(Future.failedFuture(ar.cause()));
         return;
@@ -179,7 +179,7 @@ public class CounterImpl implements Counter {
           )
           .build());
       future.complete(txnRes.getSucceeded());
-    }, resultHandler);
+    }, false, resultHandler);
   }
 
 }

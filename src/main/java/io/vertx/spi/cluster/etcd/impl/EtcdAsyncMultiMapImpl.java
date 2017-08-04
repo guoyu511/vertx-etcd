@@ -19,6 +19,8 @@ import io.grpc.ManagedChannel;
 import io.vertx.core.AsyncResult;
 import io.vertx.core.Handler;
 import io.vertx.core.Vertx;
+import io.vertx.core.impl.ContextImpl;
+import io.vertx.core.impl.TaskQueue;
 import io.vertx.core.spi.cluster.AsyncMultiMap;
 import io.vertx.core.spi.cluster.ChoosableIterable;
 
@@ -32,68 +34,67 @@ public class EtcdAsyncMultiMapImpl<K, V> implements AsyncMultiMap<K, V> {
 
   private Vertx vertx;
 
-  private String name;
-
   private KVGrpc.KVBlockingStub kvStub;
 
-  private ByteString rangeBegin, rangeEnd;
+  private String rangeBegin, rangeEnd;
 
-  public EtcdAsyncMultiMapImpl(String name, ManagedChannel channel, Vertx vertx) {
+  private long lease;
+
+  private TaskQueue taskQueue;
+
+  //TODO performance enhancement, avoid to use single task queue
+  public EtcdAsyncMultiMapImpl(String name, long lease, ManagedChannel channel, Vertx vertx) {
     this.vertx = vertx;
-    this.name = name;
     this.kvStub = KVGrpc.newBlockingStub(channel);
-    rangeBegin = toByteString(name + "/");
-    rangeEnd = toByteString(name + "0");
+    this.lease = lease;
+    this.taskQueue = new TaskQueue();
+    rangeBegin = name + "/";
+    rangeEnd = name + "0";
   }
 
   @Override
   public void add(K k, V v, Handler<AsyncResult<Void>> handler) {
-    vertx.executeBlocking(future -> {
+    getContext().executeBlocking(future -> {
       kvStub.put(
         PutRequest.newBuilder()
-          .setKey(rangeBegin
-            .concat(toByteString(k))
-            .concat(toByteString("/"))
-            .concat(toByteString(v))
-          )
+          .setKey(ByteString.copyFromUtf8(
+            rangeBegin + k + "/" + v
+          ))
           .setValue(toByteString(v))
+          .setLease(lease)
           .build());
       future.complete();
-    }, handler);
+    }, taskQueue, handler);
   }
 
   @Override
   public void get(K k, Handler<AsyncResult<ChoosableIterable<V>>> handler) {
-    vertx.executeBlocking(future -> {
+    getContext().executeBlocking(future -> {
       RangeResponse rangeRes = kvStub.range(
         RangeRequest.newBuilder()
-          .setKey(rangeBegin
-            .concat(toByteString(k)
-            .concat(toByteString("/"))
+          .setKey(ByteString.copyFromUtf8(
+            rangeBegin + k + "/"
           ))
-          .setRangeEnd(rangeBegin
-            .concat(toByteString(k)
-            .concat(toByteString("0"))
+          .setRangeEnd(ByteString.copyFromUtf8(
+            rangeBegin + k + "0"
           ))
           .build());
       future.complete(new KeyValueIterable<>(rangeRes));
-    }, handler);
+    }, taskQueue, handler);
   }
 
   @Override
   public void remove(K k, V v, Handler<AsyncResult<Boolean>> handler) {
-    vertx.executeBlocking(future -> {
+    getContext().executeBlocking(future -> {
       DeleteRangeResponse deleteRes = kvStub.deleteRange(
         DeleteRangeRequest.newBuilder()
-          .setKey(rangeBegin
-            .concat(toByteString(k)
-            .concat(toByteString("/"))
-            .concat(toByteString(v))
+          .setKey(ByteString.copyFromUtf8(
+            rangeBegin + k + "/" + v
           ))
           .build()
       );
       future.complete(deleteRes.getDeleted() > 0);
-    }, handler);
+    }, taskQueue, handler);
   }
 
   @Override
@@ -104,11 +105,11 @@ public class EtcdAsyncMultiMapImpl<K, V> implements AsyncMultiMap<K, V> {
 
   @Override
   public void removeAllMatching(Predicate<V> p, Handler<AsyncResult<Void>> handler) {
-    vertx.executeBlocking(future -> {
+    getContext().executeBlocking(future -> {
       RangeResponse rangeRes = kvStub.range(
         RangeRequest.newBuilder()
-          .setKey(rangeBegin)
-          .setRangeEnd(rangeEnd)
+          .setKey(ByteString.copyFromUtf8(rangeBegin))
+          .setRangeEnd(ByteString.copyFromUtf8(rangeEnd))
           .build());
       rangeRes.getKvsList()
         .stream()
@@ -121,7 +122,11 @@ public class EtcdAsyncMultiMapImpl<K, V> implements AsyncMultiMap<K, V> {
               .build()
           ));
       future.complete();
-    }, handler);
+    }, false, handler);
+  }
+
+  private ContextImpl getContext() {
+    return ((ContextImpl)vertx.getOrCreateContext());
   }
 
   private static class KeyValueIterable<V> implements ChoosableIterable<V> {
