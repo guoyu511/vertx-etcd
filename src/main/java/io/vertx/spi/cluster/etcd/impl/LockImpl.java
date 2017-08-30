@@ -34,8 +34,6 @@ public class LockImpl implements Lock {
 
   private Vertx vertx;
 
-  private ContextImpl context;
-
   private ByteString key;
 
   private KVGrpc.KVBlockingStub kvStub;
@@ -59,7 +57,6 @@ public class LockImpl implements Lock {
   public LockImpl(String name, long timeout, long sharedLease, ManagedChannel channel, Vertx vertx) {
     this.key = ByteString.copyFromUtf8(name);
     this.vertx = vertx;
-    this.context = (ContextImpl)vertx.getOrCreateContext();
     this.timeout = timeout;
     this.sharedLease = sharedLease;
     kvStub = KVGrpc.newBlockingStub(channel);
@@ -74,7 +71,7 @@ public class LockImpl implements Lock {
 
   @Override
   public void release() {
-    context.executeBlocking(future ->
+    getContext().executeBlocking(future ->
       kvStub.deleteRange(
         DeleteRangeRequest.newBuilder()
           .setKey(key).build())
@@ -82,7 +79,7 @@ public class LockImpl implements Lock {
   }
 
   private void tryAquire() {
-    context.<Boolean>executeBlocking(future -> {
+    getContext().<Boolean>executeBlocking(future -> {
       TxnResponse txnRes = kvStub.txn(
         TxnRequest.newBuilder()
           .addCompare(Compare.newBuilder()
@@ -113,7 +110,7 @@ public class LockImpl implements Lock {
   }
 
   private void startWatch() {
-    context.<StreamObserver<WatchRequest>>executeBlocking(future -> {
+    getContext().<StreamObserver<WatchRequest>>executeBlocking(future -> {
       StreamObserver<WatchRequest> watcher = watchStub.watch(new Observer());
       watcher.onNext(
         WatchRequest.newBuilder()
@@ -132,7 +129,7 @@ public class LockImpl implements Lock {
     if (watcher == null) {
       return;
     }
-    context.executeBlocking(future -> {
+    getContext().executeBlocking(future -> {
       watcher.onNext(WatchRequest.newBuilder()
         .setCancelRequest(
           WatchCancelRequest.newBuilder()
@@ -160,16 +157,21 @@ public class LockImpl implements Lock {
   }
 
   private void failImmediately(Throwable t) {
+    //TODO make it chain with callback
     cancelWatch();
     cancelTimeout();
     handler.handle(Future.failedFuture(t));
+  }
+
+  private ContextImpl getContext() {
+    return (ContextImpl)vertx.getOrCreateContext();
   }
 
   private class Observer implements StreamObserver<WatchResponse> {
 
     @Override
     public void onNext(WatchResponse watchRes) {
-      context.runOnContext((ignore) -> {
+      getContext().runOnContext((ignore) -> {
         if (watchRes.getCanceled()) {
           return;
         }
@@ -187,7 +189,7 @@ public class LockImpl implements Lock {
 
     @Override
     public void onError(Throwable t) {
-      context.runOnContext(ignore -> failImmediately(t));
+      getContext().runOnContext(ignore -> failImmediately(t));
     }
 
     @Override

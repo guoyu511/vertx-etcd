@@ -42,7 +42,7 @@ public class EtcdAsyncMultiMapImpl<K, V> implements AsyncMultiMap<K, V> {
 
   private TaskQueue taskQueue;
 
-  //TODO performance enhancement, avoid to use single task queue
+  //TODO performance enhancement, using in memory cache for multimap
   public EtcdAsyncMultiMapImpl(String name, long lease, ManagedChannel channel, Vertx vertx) {
     this.vertx = vertx;
     this.kvStub = KVGrpc.newBlockingStub(channel);
@@ -122,7 +122,7 @@ public class EtcdAsyncMultiMapImpl<K, V> implements AsyncMultiMap<K, V> {
               .build()
           ));
       future.complete();
-    }, false, handler);
+    }, taskQueue, handler);
   }
 
   private ContextImpl getContext() {
