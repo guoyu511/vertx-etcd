@@ -10,7 +10,7 @@ public class EtcdClusteredEventBusTest extends ClusteredEventBusTest {
 
   @Override
   protected ClusterManager getClusterManager() {
-    return new EtcdClusterManager("10.36.4.55", 2379);
+    return new EtcdClusterManager("127.0.0.1", 2379, "test-vertx-cluster");
   }
 
 }

@@ -1,5 +1,8 @@
 package io.vertx.test.core;
 
+import com.coreos.jetcd.api.DeleteRangeRequest;
+import com.google.protobuf.ByteString;
+
 import io.vertx.core.spi.cluster.ClusterManager;
 import io.vertx.spi.cluster.etcd.EtcdClusterManager;
 
@@ -8,9 +11,21 @@ import io.vertx.spi.cluster.etcd.EtcdClusterManager;
  */
 public class EtcdClusteredSharedCounterTest extends ClusteredSharedCounterTest {
 
+  private EtcdClusterManager clusterManager;
+
+  @Override
+  public void after() throws Exception {
+    clusterManager.getKVStub()
+      .deleteRange(DeleteRangeRequest.newBuilder()
+        .setKey(ByteString.copyFromUtf8("test-vertx-cluster/"))
+        .setRangeEnd(ByteString.copyFromUtf8("test-vertx-cluster0"))
+        .build());
+    super.after();
+  }
+
   @Override
   protected ClusterManager getClusterManager() {
-    return new EtcdClusterManager("10.36.4.55", 2379);
+    return clusterManager = new EtcdClusterManager("127.0.0.1", 2379, "test-vertx-cluster");
   }
 
 }

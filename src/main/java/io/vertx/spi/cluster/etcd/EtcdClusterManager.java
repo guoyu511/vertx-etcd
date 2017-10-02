@@ -201,6 +201,10 @@ public class EtcdClusterManager implements ClusterManager {
     return active;
   }
 
+  public KVGrpc.KVBlockingStub getKVStub() {
+    return kvStub;
+  }
+
   private ManagedChannel buildChannel() {
     grpcEventLoop = new NioEventLoopGroup(1,
       (ThreadFactory) (r) -> new Thread(r, "vertx-etcd-eventloop"));

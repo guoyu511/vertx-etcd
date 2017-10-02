@@ -1,8 +1,3 @@
-*
-!.travis.yml
-!LICENSE
-!.gitignore
-!src
-!src/**
-!pom.xml
-!README.md
+.idea
+*.iml
+target
