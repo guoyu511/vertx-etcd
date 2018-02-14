@@ -1,15 +1,22 @@
 package io.vertx.spi.cluster.etcd.impl;
 
-import com.google.protobuf.ByteString;
+import static io.vertx.spi.cluster.etcd.impl.Codec.fromByteString;
+import static io.vertx.spi.cluster.etcd.impl.Codec.toByteString;
+import static java.util.stream.Collectors.toList;
+import static java.util.stream.Collectors.toMap;
+import static java.util.stream.Collectors.toSet;
+
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
 
 import com.coreos.jetcd.api.Compare;
 import com.coreos.jetcd.api.DeleteRangeRequest;
 import com.coreos.jetcd.api.DeleteRangeResponse;
 import com.coreos.jetcd.api.KVGrpc;
-import com.coreos.jetcd.api.LeaseGrantRequest;
-import com.coreos.jetcd.api.LeaseGrantResponse;
-import com.coreos.jetcd.api.LeaseGrpc;
 import com.coreos.jetcd.api.PutRequest;
+import com.coreos.jetcd.api.PutResponse;
 import com.coreos.jetcd.api.RangeRequest;
 import com.coreos.jetcd.api.RangeResponse;
 import com.coreos.jetcd.api.RequestOp;
@@ -18,267 +25,290 @@ import com.coreos.jetcd.api.TxnResponse;
 
 import io.grpc.ManagedChannel;
 import io.vertx.core.AsyncResult;
+import io.vertx.core.Future;
 import io.vertx.core.Handler;
-import io.vertx.core.Vertx;
 import io.vertx.core.shareddata.AsyncMap;
-
-import static io.vertx.spi.cluster.etcd.impl.Codec.fromByteString;
-import static io.vertx.spi.cluster.etcd.impl.Codec.toByteString;
 
 /**
  * @author <a href="mailto:guoyu.511@gmail.com">Guo Yu</a>
  */
 public class EtcdAsyncMapImpl<K, V> implements AsyncMap<K, V> {
 
-  private Vertx vertx;
+  private KVGrpc.KVVertxStub kvStub;
 
-  private KVGrpc.KVBlockingStub kvStub;
+  private KeyPath keyPath;
 
-  private LeaseGrpc.LeaseBlockingStub leaseStub;
-
-  private String rangeBegin, rangeEnd;
-
-  public EtcdAsyncMapImpl(String name, ManagedChannel channel, Vertx vertx) {
-    this.vertx = vertx;
-    this.kvStub = KVGrpc.newBlockingStub(channel);
-    this.leaseStub = LeaseGrpc.newBlockingStub(channel);
-    rangeBegin = name + "/";
-    rangeEnd = name + "0"; // '0' is the next char of '/'
+  public EtcdAsyncMapImpl(KeyPath keyPath, ManagedChannel channel) {
+    this.keyPath = keyPath;
+    this.kvStub = KVGrpc.newVertxStub(channel);
   }
 
   @Override
   public void get(K k, Handler<AsyncResult<V>> handler) {
-    vertx.executeBlocking(future -> {
-      RangeResponse res = kvStub.range(
+    Future.<RangeResponse>future(fut ->
+      kvStub.range(
         RangeRequest.newBuilder()
-          .setKey(keyPath(k)).build());
-      if (res.getKvsCount() == 0) {
-        future.complete();
-      } else {
-        future.complete(
-          fromByteString(res.getKvs(0).getValue())
-        );
-      }
-    }, false, handler);
+          .setKey(keyPath.getKey(k))
+          .build(), fut))
+      .map(res ->
+        res.getKvsList().stream()
+          .findFirst()
+          .<V>map(kv -> fromByteString(kv.getValue()))
+          .orElse(null)
+      )
+      .setHandler(handler);
+  }
+
+  @Override
+  public void keys(Handler<AsyncResult<Set<K>>> handler) {
+    Future.<RangeResponse>future(fut ->
+      kvStub.range(
+        RangeRequest.newBuilder()
+          .setKey(keyPath.rangeBegin())
+          .setRangeEnd(keyPath.rangeEnd())
+          .build(), fut))
+      .map(res ->
+        res.getKvsList().stream()
+          .<K>map(kv -> keyPath.getRawKey(kv.getKey()))
+          .filter(Objects::nonNull)
+          .collect(toSet())
+      )
+      .setHandler(handler);
+  }
+
+  @Override
+  public void values(Handler<AsyncResult<List<V>>> handler) {
+    Future.<RangeResponse>future(fut ->
+      kvStub.range(
+        RangeRequest.newBuilder()
+          .setKey(keyPath.rangeBegin())
+          .setRangeEnd(keyPath.rangeEnd())
+          .build(), fut))
+      .map(res ->
+        res.getKvsList().stream()
+          .<V>map(kv -> fromByteString(kv.getValue()))
+          .filter(Objects::nonNull)
+          .collect(toList())
+      )
+      .setHandler(handler);
+  }
+
+  @Override
+  public void entries(Handler<AsyncResult<Map<K, V>>> handler) {
+    Future.<RangeResponse>future(fut ->
+      kvStub.range(
+        RangeRequest.newBuilder()
+          .setKey(keyPath.rangeBegin())
+          .setRangeEnd(keyPath.rangeEnd())
+          .build(), fut))
+      .<Map<K, V>>map(res ->
+        res.getKvsList().stream()
+          .collect(toMap(
+            kv -> keyPath.getRawKey(kv.getKey()),
+            kv -> fromByteString(kv.getValue())
+          ))
+      )
+      .setHandler(handler);
   }
 
   @Override
   public void put(K k, V v, Handler<AsyncResult<Void>> handler) {
-    vertx.executeBlocking(future -> {
+    Future.<PutResponse>future(fut ->
       kvStub.put(
         PutRequest.newBuilder()
-          .setKey(keyPath(k))
+          .setKey(keyPath.getKey(k))
           .setValue(toByteString(v))
-          .build());
-      future.complete();
-    }, false, handler);
+          .build(), fut))
+      .<Void>mapEmpty()
+      .setHandler(handler);
   }
 
   @Override
   public void put(K k, V v, long ttl, Handler<AsyncResult<Void>> handler) {
-    vertx.executeBlocking(future -> {
-      LeaseGrantResponse leaseRes = leaseStub.leaseGrant(LeaseGrantRequest.newBuilder()
-        .setTTL(castToSeconds(ttl)) // cast ms to sec
-        .build());
+    //TODO submit to ttl scheduler
+    Future.<PutResponse>future(fut ->
       kvStub.put(
         PutRequest.newBuilder()
-          .setKey(keyPath(k))
+          .setKey(keyPath.getKey(k))
           .setValue(toByteString(v))
-          .setLease(leaseRes.getID())
-          .build());
-      future.complete();
-    }, false, handler);
+          .build(), fut))
+      .<Void>mapEmpty()
+      .setHandler(handler);
   }
 
   @Override
   public void putIfAbsent(K k, V v, Handler<AsyncResult<V>> handler) {
-    vertx.executeBlocking(future -> {
-      TxnResponse txnRes = kvStub.txn(
+    Future.<TxnResponse>future(fut ->
+      kvStub.txn(
         TxnRequest.newBuilder()
           .addCompare(Compare.newBuilder()
-            .setKey(keyPath(k))
+            .setKey(keyPath.getKey(k))
             .setTarget(Compare.CompareTarget.VERSION)
-            .setResult(Compare.CompareResult.LESS)
-            .setVersion(1)
+            .setResult(Compare.CompareResult.EQUAL)
+            .setVersion(0)
           )
           .addSuccess(RequestOp.newBuilder()
             .setRequestPut(PutRequest.newBuilder()
-              .setKey(keyPath(k))
+              .setKey(keyPath.getKey(k))
               .setValue(toByteString(v)))
           )
           .addFailure(RequestOp.newBuilder()
             .setRequestRange(RangeRequest.newBuilder()
-              .setKey(keyPath(k)))
+              .setKey(keyPath.getKey(k)))
           )
-          .build());
-      if (txnRes.getSucceeded()) {
-        future.complete(null);
-      } else {
-        future.complete(
-          fromByteString(txnRes.getResponses(0)
-            .getResponseRange().getKvs(0).getValue())
-        );
-      }
-    }, false, handler);
+          .build(), fut))
+      .<V>map(res -> {
+        if (res.getSucceeded()) {
+          return null;
+        }
+        return fromByteString(res.getResponses(0)
+          .getResponseRange().getKvs(0).getValue());
+      })
+      .setHandler(handler);
   }
 
   @Override
   public void putIfAbsent(K k, V v, long ttl, Handler<AsyncResult<V>> handler) {
-    vertx.executeBlocking(future -> {
-      LeaseGrantResponse leaseRes = leaseStub.leaseGrant(LeaseGrantRequest.newBuilder()
-        .setTTL(castToSeconds(ttl)) // cast ms to sec
-        .build());
-      TxnResponse txnRes = kvStub.txn(
+    //TODO submit to ttl scheduler
+    Future.<TxnResponse>future(fut ->
+      kvStub.txn(
         TxnRequest.newBuilder()
           .addCompare(Compare.newBuilder()
-            .setKey(keyPath(k))
+            .setKey(keyPath.getKey(k))
             .setTarget(Compare.CompareTarget.VERSION)
-            .setResult(Compare.CompareResult.LESS)
-            .setVersion(1)
+            .setResult(Compare.CompareResult.EQUAL)
+            .setVersion(0)
           )
           .addSuccess(RequestOp.newBuilder()
             .setRequestPut(PutRequest.newBuilder()
-              .setKey(keyPath(k))
-              .setValue(toByteString(v))
-              .setLease(leaseRes.getID()))
+              .setKey(keyPath.getKey(k))
+              .setValue(toByteString(v)))
           )
           .addFailure(RequestOp.newBuilder()
             .setRequestRange(RangeRequest.newBuilder()
-              .setKey(keyPath(k)))
+              .setKey(keyPath.getKey(k)))
           )
-          .build());
-      if (txnRes.getSucceeded()) {
-        future.complete(null);
-      } else {
-        future.complete(
-          fromByteString(txnRes.getResponses(0)
-            .getResponseRange().getKvs(0).getValue())
-        );
-      }
-    }, false, handler);
+          .build(), fut))
+      .<V>map(res -> {
+        if (res.getSucceeded()) {
+          return null;
+        }
+        return fromByteString(res.getResponses(0)
+          .getResponseRange().getKvs(0).getValue());
+      })
+      .setHandler(handler);
   }
 
   @Override
   public void remove(K k, Handler<AsyncResult<V>> handler) {
-    vertx.executeBlocking(future -> {
-      DeleteRangeResponse deleteRes = kvStub.deleteRange(
+    Future.<DeleteRangeResponse>future(fut ->
+      kvStub.deleteRange(
         DeleteRangeRequest.newBuilder()
-          .setKey(keyPath(k))
+          .setKey(keyPath.getKey(k))
           .setPrevKv(true)
-          .build());
-      if (deleteRes.getPrevKvsCount() == 0) {
-        future.complete();
-      } else {
-        future.complete(
-          fromByteString(deleteRes.getPrevKvs(0).getValue())
-        );
-      }
-    }, false, handler);
+          .build(), fut))
+      .map(res -> res.getPrevKvsList()
+        .stream()
+        .findFirst()
+        .<V>map(kv -> fromByteString(kv.getValue()))
+        .orElse(null)
+      )
+      .setHandler(handler);
   }
 
   @Override
   public void removeIfPresent(K k, V v, Handler<AsyncResult<Boolean>> handler) {
-    vertx.executeBlocking(future -> {
-      TxnResponse txnRes = kvStub.txn(
+    Future.<TxnResponse>future(fut ->
+      kvStub.txn(
         TxnRequest.newBuilder()
           .addCompare(Compare.newBuilder()
-            .setKey(keyPath(k))
+            .setKey(keyPath.getKey(k))
             .setTarget(Compare.CompareTarget.VALUE)
             .setResult(Compare.CompareResult.EQUAL)
             .setValue(toByteString(v))
           )
           .addSuccess(RequestOp.newBuilder()
             .setRequestDeleteRange(DeleteRangeRequest.newBuilder()
-              .setKey(keyPath(k)))
+              .setKey(keyPath.getKey(k)))
           )
-          .build());
-      future.complete(txnRes.getSucceeded());
-    }, false, handler);
+          .build(), fut))
+      .map(TxnResponse::getSucceeded)
+      .setHandler(handler);
   }
 
   @Override
   public void replace(K k, V v, Handler<AsyncResult<V>> handler) {
-    vertx.executeBlocking(future -> {
-      TxnResponse txnRes = kvStub.txn(
+    Future.<TxnResponse>future(fut ->
+      kvStub.txn(
         TxnRequest.newBuilder()
           .addCompare(Compare.newBuilder()
-            .setKey(keyPath(k))
+            .setKey(keyPath.getKey(k))
             .setTarget(Compare.CompareTarget.VERSION)
             .setResult(Compare.CompareResult.GREATER)
             .setVersion(0)
           )
           .addSuccess(RequestOp.newBuilder()
             .setRequestPut(PutRequest.newBuilder()
-              .setKey(keyPath(k))
+              .setKey(keyPath.getKey(k))
               .setPrevKv(true)
               .setValue(toByteString(v)))
           )
-          .build()
-      );
-      if (!txnRes.getSucceeded()) {
-        future.complete();
-      } else {
-        future.complete(
-          fromByteString(txnRes.getResponses(0)
-            .getResponsePut().getPrevKv().getValue())
-        );
-      }
-    }, false, handler);
+          .build(), fut))
+      .<V>map(res -> {
+        if (!res.getSucceeded()) {
+          return null;
+        } else {
+          return fromByteString(res.getResponses(0)
+            .getResponsePut().getPrevKv().getValue());
+        }
+      })
+      .setHandler(handler);
   }
 
   @Override
   public void replaceIfPresent(K k, V oldValue, V newValue, Handler<AsyncResult<Boolean>> handler) {
-    vertx.executeBlocking(future -> {
-      TxnResponse txnRes = kvStub.txn(
+    Future.<TxnResponse>future(fut ->
+      kvStub.txn(
         TxnRequest.newBuilder()
           .addCompare(Compare.newBuilder()
-            .setKey(keyPath(k))
+            .setKey(keyPath.getKey(k))
             .setTarget(Compare.CompareTarget.VALUE)
             .setResult(Compare.CompareResult.EQUAL)
             .setValue(toByteString(oldValue))
           )
           .addSuccess(RequestOp.newBuilder()
             .setRequestPut(PutRequest.newBuilder()
-              .setKey(keyPath(k))
+              .setKey(keyPath.getKey(k))
               .setValue(toByteString(newValue)))
           )
-          .build()
-      );
-      future.complete(txnRes.getSucceeded());
-    }, false, handler);
+          .build(), fut))
+      .map(TxnResponse::getSucceeded)
+      .setHandler(handler);
   }
 
   @Override
   public void clear(Handler<AsyncResult<Void>> handler) {
-    vertx.executeBlocking(future -> {
+    Future.<DeleteRangeResponse>future(fut ->
       kvStub.deleteRange(
         DeleteRangeRequest.newBuilder()
-          .setKey(ByteString.copyFromUtf8(rangeBegin))
-          .setRangeEnd(ByteString.copyFromUtf8(rangeEnd))
-          .build());
-      future.complete();
-    }, false, handler);
+          .setKey(keyPath.rangeBegin())
+          .setRangeEnd(keyPath.rangeEnd())
+          .build(), fut))
+      .<Void>mapEmpty()
+      .setHandler(handler);
   }
 
   @Override
   public void size(Handler<AsyncResult<Integer>> handler) {
-    vertx.executeBlocking(future -> {
-      RangeResponse rangeRes = kvStub.range(
+    Future.<RangeResponse>future(fut ->
+      kvStub.range(
         RangeRequest.newBuilder()
-          .setKey(ByteString.copyFromUtf8(rangeBegin))
-          .setRangeEnd(ByteString.copyFromUtf8(rangeEnd))
-          .build());
-      future.complete(rangeRes.getKvsCount());
-    }, false, handler);
-  }
-
-  private ByteString keyPath(K key) {
-    return ByteString.copyFromUtf8(rangeBegin + key);
-  }
-
-  private long castToSeconds(long ttl) {
-    //TODO missing accuracy
-    return ttl / 1000 + ttl % 1000 == 0 ? 0 : 1;
+          .setKey(keyPath.rangeBegin())
+          .setRangeEnd(keyPath.rangeEnd())
+          .setCountOnly(true)
+          .build(), fut))
+      .map(res -> (int)res.getCount())
+      .setHandler(handler);
   }
 
 }

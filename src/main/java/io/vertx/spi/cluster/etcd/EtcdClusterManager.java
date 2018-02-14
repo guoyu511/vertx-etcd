@@ -1,33 +1,36 @@
 package io.vertx.spi.cluster.etcd;
 
-import com.google.protobuf.ByteString;
+import static io.vertx.spi.cluster.etcd.impl.Codec.fromByteString;
+import static io.vertx.spi.cluster.etcd.impl.Codec.toByteString;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
 
 import com.coreos.jetcd.api.Event;
 import com.coreos.jetcd.api.KVGrpc;
 import com.coreos.jetcd.api.KeyValue;
 import com.coreos.jetcd.api.LeaseGrantRequest;
+import com.coreos.jetcd.api.LeaseGrantResponse;
 import com.coreos.jetcd.api.LeaseGrpc;
 import com.coreos.jetcd.api.LeaseKeepAliveRequest;
-import com.coreos.jetcd.api.LeaseKeepAliveResponse;
 import com.coreos.jetcd.api.LeaseRevokeRequest;
+import com.coreos.jetcd.api.LeaseRevokeResponse;
 import com.coreos.jetcd.api.PutRequest;
+import com.coreos.jetcd.api.PutResponse;
+import com.coreos.jetcd.api.WatchCancelRequest;
 import com.coreos.jetcd.api.WatchCreateRequest;
 import com.coreos.jetcd.api.WatchGrpc;
 import com.coreos.jetcd.api.WatchRequest;
 import com.coreos.jetcd.api.WatchResponse;
-
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.UUID;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ThreadFactory;
-import java.util.stream.Collectors;
+import com.google.protobuf.ByteString;
 
 import io.grpc.ManagedChannel;
 import io.grpc.netty.NettyChannelBuilder;
-import io.grpc.stub.StreamObserver;
-import io.netty.channel.nio.NioEventLoopGroup;
 import io.vertx.core.AsyncResult;
 import io.vertx.core.Future;
 import io.vertx.core.Handler;
@@ -38,16 +41,21 @@ import io.vertx.core.shareddata.Lock;
 import io.vertx.core.spi.cluster.AsyncMultiMap;
 import io.vertx.core.spi.cluster.ClusterManager;
 import io.vertx.core.spi.cluster.NodeListener;
+import io.vertx.grpc.GrpcBidiExchange;
+import io.vertx.grpc.VertxChannelBuilder;
 import io.vertx.spi.cluster.etcd.impl.CounterImpl;
 import io.vertx.spi.cluster.etcd.impl.EtcdAsyncMapImpl;
 import io.vertx.spi.cluster.etcd.impl.EtcdAsyncMultiMapImpl;
 import io.vertx.spi.cluster.etcd.impl.EtcdSyncMapImpl;
+import io.vertx.spi.cluster.etcd.impl.KeyPath;
 import io.vertx.spi.cluster.etcd.impl.LockImpl;
 
 /**
  * @author <a href="mailto:guoyu.511@gmail.com">Guo Yu</a>
  */
 public class EtcdClusterManager implements ClusterManager {
+
+  private static final long KEEP_ALIVE_TIME = 5l;
 
   private String host;
 
@@ -59,29 +67,31 @@ public class EtcdClusterManager implements ClusterManager {
 
   private ManagedChannel managedChannel;
 
+  private ManagedChannel rawChannel;
+
   private NodeListener nodeListener;
 
-  private KVGrpc.KVBlockingStub kvStub;
+  private KVGrpc.KVVertxStub kvStub;
 
-  private LeaseGrpc.LeaseBlockingStub leaseStub;
+  private LeaseGrpc.LeaseVertxStub leaseStub;
 
-  private WatchGrpc.WatchStub watchStub;
+  private WatchGrpc.WatchVertxStub watchStub;
 
-  private ConcurrentHashMap<String, String> nodeCache = new ConcurrentHashMap<>();
+  private KeyPath nodePath;
 
-  private NioEventLoopGroup grpcEventLoop;
+  private ConcurrentHashMap<ByteString, String> nodeCache = new ConcurrentHashMap<>();
 
-  private long keepAlivePeriodic;
+  private Long keepAliveTimerId;
+
+  private Long sharedLease;
+
+  private Long watchId;
+
+  private volatile GrpcBidiExchange<WatchResponse, WatchRequest> watchExchange;
 
   private volatile boolean active;
 
   private volatile String nodeId;
-
-  private volatile long sharedLease;
-
-  private static final String ETCD_CLUSTER_NODES = "cluster/nodes";
-
-  private static final long ETCD_TIMEOUT = 5l;
 
   public EtcdClusterManager(String host, int port) {
     this(host, port, "vertx");
@@ -91,6 +101,7 @@ public class EtcdClusterManager implements ClusterManager {
     this.host = host;
     this.port = port;
     this.prefix = prefix;
+    this.nodePath = KeyPath.path(prefix + "/cluster/nodes");
   }
 
   @Override
@@ -99,40 +110,41 @@ public class EtcdClusterManager implements ClusterManager {
   }
 
   @Override
-  public <K, V> void getAsyncMultiMap(String name, Handler<AsyncResult<AsyncMultiMap<K, V>>> asyncResultHandler) {
+  public <K, V> void getAsyncMultiMap(String name, Handler<AsyncResult<AsyncMultiMap<K, V>>> handler) {
     vertx.runOnContext((ignore) -> {
       long lease = name.equals("__vertx.subs") ? sharedLease : 0;
-      asyncResultHandler.handle(Future.succeededFuture(
-        new EtcdAsyncMultiMapImpl<>(prefix + "/maps/" + name, lease, managedChannel, vertx)));
+      EtcdAsyncMultiMapImpl<K, V> map = new EtcdAsyncMultiMapImpl<>(
+        KeyPath.path(prefix + "/multimaps/" + name), lease, managedChannel);
+      map.init(handler);
     });
   }
 
   @Override
-  public <K, V> void getAsyncMap(String name, Handler<AsyncResult<AsyncMap<K, V>>> asyncResultHandler) {
+  public <K, V> void getAsyncMap(String name, Handler<AsyncResult<AsyncMap<K, V>>> handler) {
     vertx.runOnContext((ignore) ->
-      asyncResultHandler.handle(Future.succeededFuture(
-        new EtcdAsyncMapImpl<>(prefix + "/maps/" + name, managedChannel, vertx)))
+      handler.handle(Future.succeededFuture(
+        new EtcdAsyncMapImpl<>(KeyPath.path(prefix + "/maps/" + name), managedChannel)))
     );
   }
 
   @Override
   public <K, V> Map<K, V> getSyncMap(String name) {
-    return new EtcdSyncMapImpl(prefix + "/maps/" + name, sharedLease, managedChannel);
+    return new EtcdSyncMapImpl<>(KeyPath.path(prefix + "/maps/" + name), sharedLease, rawChannel);
   }
 
   @Override
-  public void getLockWithTimeout(String name, long timeout, Handler<AsyncResult<Lock>> resultHandler) {
+  public void getLockWithTimeout(String name, long timeout, Handler<AsyncResult<Lock>> handler) {
     vertx.runOnContext((ignore) -> {
       LockImpl lock = new LockImpl(name, timeout, sharedLease, managedChannel, vertx);
-      lock.aquire(resultHandler);
+      lock.aquire(handler);
     });
   }
 
   @Override
-  public void getCounter(String name, Handler<AsyncResult<Counter>> resultHandler) {
+  public void getCounter(String name, Handler<AsyncResult<Counter>> handler) {
     vertx.runOnContext((ignore) ->
-      resultHandler.handle(Future.succeededFuture(
-        new CounterImpl(prefix + "/counters/" + name, sharedLease, managedChannel, vertx)))
+      handler.handle(Future.succeededFuture(
+        new CounterImpl(prefix + "/counters/" + name, sharedLease, managedChannel)))
     );
   }
 
@@ -143,8 +155,7 @@ public class EtcdClusterManager implements ClusterManager {
 
   @Override
   public List<String> getNodes() {
-    return nodeCache.keySet().stream()
-      .collect(Collectors.toList());
+    return new ArrayList<>(nodeCache.values());
   }
 
   @Override
@@ -154,46 +165,60 @@ public class EtcdClusterManager implements ClusterManager {
 
   @Override
   public void join(Handler<AsyncResult<Void>> handler) {
-    nodeId = UUID.randomUUID().toString();
-    managedChannel = buildChannel();
-    leaseStub = LeaseGrpc.newBlockingStub(managedChannel);
-    kvStub = KVGrpc.newBlockingStub(managedChannel);
-    watchStub = WatchGrpc.newStub(managedChannel);
-    vertx.executeBlocking(future -> {
-      sharedLease = leaseStub.leaseGrant(LeaseGrantRequest.newBuilder()
-        .setTTL(ETCD_TIMEOUT)
-        .build()).getID();
-      kvStub.put(PutRequest.newBuilder()
-        .setLease(sharedLease)
-        .setKey(ByteString.copyFromUtf8(prefix + "/" + ETCD_CLUSTER_NODES + "/" + nodeId))
-        .setValue(ByteString.copyFromUtf8(nodeId))
-        .build());
-      watchStub.watch(new NodeObserver())
-        .onNext(WatchRequest.newBuilder()
-          .setCreateRequest(WatchCreateRequest.newBuilder()
-            .setKey(ByteString.copyFromUtf8(prefix + "/" + ETCD_CLUSTER_NODES + "/" ))
-            .setRangeEnd(ByteString.copyFromUtf8(prefix + "/" + ETCD_CLUSTER_NODES + "0" ))
-          )
-          .build());
-      startKeepAlive(sharedLease);
-      nodeCache.put(prefix + "/" + ETCD_CLUSTER_NODES + "/" + nodeId, nodeId);
-      active = true;
-      future.complete();
-    }, handler);
+    vertx.runOnContext(v -> {
+      nodeId = UUID.randomUUID().toString();
+      managedChannel = VertxChannelBuilder.forAddress(vertx, host, port)
+        .usePlaintext(true)
+        .build();
+      rawChannel = NettyChannelBuilder.forAddress(host, port)
+        .usePlaintext(true)
+        .build();
+      leaseStub = LeaseGrpc.newVertxStub(managedChannel);
+      kvStub = KVGrpc.newVertxStub(managedChannel);
+      watchStub = WatchGrpc.newVertxStub(managedChannel);
+      startKeepAlive()
+        .compose(lease -> Future.<PutResponse>future(fut ->
+          kvStub.put(PutRequest.newBuilder()
+            .setLease(sharedLease)
+            .setKey(nodePath.getKey(nodeId))
+            .setValue(toByteString(nodeId))
+            .build(), fut)))
+        .compose(res -> {
+          long rev = res.getHeader().getRevision();
+          nodeCache.put(nodePath.getKey(nodeId), nodeId);
+          return startWatch(rev);
+        })
+        .<Void>map(ignore -> {
+          active = true;
+          return null;
+        })
+        .setHandler(handler);
+    });
   }
 
   @Override
   public void leave(Handler<AsyncResult<Void>> handler) {
-    vertx.cancelTimer(keepAlivePeriodic);
-    vertx.executeBlocking(future -> {
-      leaseStub.leaseRevoke(LeaseRevokeRequest.newBuilder()
-        .setID(sharedLease)
-        .build());
-      managedChannel.shutdown();
-      grpcEventLoop.shutdownGracefully();
-      active = false;
-      future.complete();
-    }, handler);
+    vertx.runOnContext(v ->
+      stopWatch()
+        .compose(ignore -> this.stopKeepAlive())
+        .compose(ignore -> {
+          Future<Void> shutdownFuture = Future.future();
+          vertx.executeBlocking((blcFuture) -> {
+            try {
+              managedChannel.shutdown();
+              managedChannel.awaitTermination(10, TimeUnit.SECONDS);
+              rawChannel.shutdown();
+              rawChannel.awaitTermination(10, TimeUnit.SECONDS);
+              active = false;
+              blcFuture.complete();
+            } catch (InterruptedException e) {
+              blcFuture.fail(e);
+            }
+          }, shutdownFuture);
+          return shutdownFuture;
+        })
+        .setHandler(handler)
+    );
   }
 
   @Override
@@ -201,76 +226,108 @@ public class EtcdClusterManager implements ClusterManager {
     return active;
   }
 
-  public KVGrpc.KVBlockingStub getKVStub() {
-    return kvStub;
-  }
-
-  private ManagedChannel buildChannel() {
-    grpcEventLoop = new NioEventLoopGroup(1,
-      (ThreadFactory) (r) -> new Thread(r, "vertx-etcd-eventloop"));
-    grpcEventLoop.execute(() -> {});  // a little magic, force the nio thread to be created
-    return NettyChannelBuilder.forAddress(host, port)
-      .eventLoopGroup(grpcEventLoop)
-      .usePlaintext(true)
-      .build();
-  }
-
-  private void startKeepAlive(long lease) {
-    LeaseGrpc.LeaseStub stub = LeaseGrpc.newStub(managedChannel);
-    StreamObserver<LeaseKeepAliveRequest> observer = stub.leaseKeepAlive(new NoopStreamObserver());
-    keepAlivePeriodic = vertx.setPeriodic(ETCD_TIMEOUT / 2, (ignore) -> {
-      observer.onNext(LeaseKeepAliveRequest.newBuilder()
-        .setID(lease)
-        .build());
-    });
-  }
-
-  private class NodeObserver implements StreamObserver<WatchResponse> {
-
-    @Override
-    public void onNext(WatchResponse watchRes) {
-      watchRes.getEventsList().forEach(event -> {
-        KeyValue kv = event.getKv();
-        String nodeId = kv.getValue().toStringUtf8();
-        if (nodeId.equals(EtcdClusterManager.this.nodeId)) {
-          return;
-        }
-        if (event.getType() == Event.EventType.PUT) {
-          nodeCache.put(kv.getKey().toStringUtf8(), nodeId);
-          if (nodeListener != null) {
-            nodeListener.nodeAdded(nodeId);
-          }
-        } else if (event.getType() == Event.EventType.DELETE) {
-          nodeCache.remove(kv.getKey().toStringUtf8());
-          if (nodeListener != null) {
-            nodeListener.nodeLeft(nodeId);
-          }
-        }
+  private Future<Void> startKeepAlive() {
+    return Future.<LeaseGrantResponse>future(fut ->
+      leaseStub.leaseGrant(
+        LeaseGrantRequest.newBuilder()
+          .setTTL(KEEP_ALIVE_TIME)
+          .build(), fut))
+      .map(res -> {
+        sharedLease = res.getID();
+        leaseStub.leaseKeepAlive(exchange ->
+          keepAliveTimerId = vertx.setPeriodic(KEEP_ALIVE_TIME / 2, (ignore) -> {
+            exchange.write(LeaseKeepAliveRequest.newBuilder()
+              .setID(sharedLease)
+              .build());
+          }));
+        return null;
       });
-    }
-
-    @Override
-    public void onError(Throwable t) {
-
-    }
-
-    @Override
-    public void onCompleted() {
-
-    }
   }
 
-  private class NoopStreamObserver implements StreamObserver<LeaseKeepAliveResponse> {
+  private Future<Void> stopKeepAlive() {
+    if (keepAliveTimerId != null) {
+      vertx.cancelTimer(keepAliveTimerId);
+    }
+    if (sharedLease == null) {
+      return Future.succeededFuture();
+    }
+    return Future.<LeaseRevokeResponse>future(fut ->
+      leaseStub.leaseRevoke(
+        LeaseRevokeRequest.newBuilder()
+          .setID(sharedLease)
+          .build(), fut))
+      .mapEmpty();
+  }
 
-    @Override
-    public void onNext(LeaseKeepAliveResponse leaseKeepAliveResponse) {}
+  private Future<Void> startWatch(long rev) {
+    Future<Void> future = Future.future();
+    watchStub.watch(exchange -> {
+      watchExchange = exchange;
+      watchExchange
+        .write(WatchRequest.newBuilder()
+          .setCreateRequest(WatchCreateRequest.newBuilder()
+            .setStartRevision(rev)
+            .setKey(nodePath.rangeBegin())
+            .setPrevKv(true)
+            .setRangeEnd(nodePath.rangeEnd())
+          )
+          .build())
+        .handler(watchRes -> {
+          if (watchRes.getCreated()) {
+            watchId = watchRes.getWatchId();
+            future.complete();
+          } else {
+            this.handleEvents(watchRes.getEventsList());
+          }
+        })
+        .exceptionHandler(future::fail);;
+    });
+    return future;
+  }
 
-    @Override
-    public void onError(Throwable throwable) {}
+  private Future<Void> stopWatch() {
+    if (watchId == null) {
+      return Future.succeededFuture();
+    }
+    Future<Void> future = Future.future();
+    watchExchange.write(
+      WatchRequest.newBuilder()
+        .setCancelRequest(
+          WatchCancelRequest.newBuilder()
+            .setWatchId(watchId)
+        )
+        .build())
+      .handler(watchRes -> {
+        if (watchRes.getCanceled()) {
+          watchId = watchRes.getWatchId();
+          future.complete();
+        } else {
+          this.handleEvents(watchRes.getEventsList());
+        }
+      })
+      .exceptionHandler(future::fail);
+    return future;
+  }
 
-    @Override
-    public void onCompleted() {}
-
+  private void handleEvents(List<Event> events) {
+    events.forEach(event -> {
+      KeyValue kv = event.getKv();
+      if (Objects.equals(kv.getKey(), nodePath.getKey(this.nodeId))) {
+        return;
+      }
+      if (event.getType() == Event.EventType.PUT) {
+        String nodeId = fromByteString(kv.getValue());
+        nodeCache.put(kv.getKey(), nodeId);
+        if (nodeListener != null) {
+          nodeListener.nodeAdded(nodeId);
+        }
+      } else if (event.getType() == Event.EventType.DELETE) {
+        nodeCache.remove(kv.getKey());
+        if (nodeListener != null) {
+          nodeListener.nodeLeft(nodeId);
+        }
+      }
+    });
   }
 
 }

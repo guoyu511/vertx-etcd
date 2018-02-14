@@ -1,6 +1,6 @@
 package io.vertx.spi.cluster.etcd.impl;
 
-import com.google.protobuf.ByteString;
+import static com.google.common.base.Preconditions.checkState;
 
 import com.coreos.jetcd.api.Compare;
 import com.coreos.jetcd.api.DeleteRangeRequest;
@@ -15,17 +15,16 @@ import com.coreos.jetcd.api.WatchCreateRequest;
 import com.coreos.jetcd.api.WatchGrpc;
 import com.coreos.jetcd.api.WatchRequest;
 import com.coreos.jetcd.api.WatchResponse;
+import com.google.protobuf.ByteString;
 
 import io.grpc.ManagedChannel;
-import io.grpc.stub.StreamObserver;
 import io.vertx.core.AsyncResult;
 import io.vertx.core.Future;
 import io.vertx.core.Handler;
 import io.vertx.core.Vertx;
 import io.vertx.core.VertxException;
-import io.vertx.core.impl.ContextImpl;
-import io.vertx.core.impl.TaskQueue;
 import io.vertx.core.shareddata.Lock;
+import io.vertx.grpc.GrpcBidiExchange;
 
 /**
  * @author <a href="mailto:guoyu.511@gmail.com">Guo Yu</a>
@@ -36,51 +35,53 @@ public class LockImpl implements Lock {
 
   private ByteString key;
 
-  private KVGrpc.KVBlockingStub kvStub;
+  private KVGrpc.KVVertxStub kvStub;
 
-  private WatchGrpc.WatchStub watchStub;
+  private WatchGrpc.WatchVertxStub watchStub;
 
   private Handler<AsyncResult<Lock>> handler;
 
-  private TaskQueue taskQueue = new TaskQueue();
+  private Long timerId;
 
-  private long timeoutTimer;
+  private Long watcherId;
 
   private long timeout;
 
   private long sharedLease;
 
-  private long watchId;
+  private GrpcBidiExchange<WatchResponse, WatchRequest> exchange;
 
-  private StreamObserver<WatchRequest> watcher;
+  private volatile State state = State.NEW;
 
-  public LockImpl(String name, long timeout, long sharedLease, ManagedChannel channel, Vertx vertx) {
-    this.key = ByteString.copyFromUtf8(name);
+  public LockImpl(String name, long timeout, long sharedLease,
+                  ManagedChannel channel, Vertx vertx) {
     this.vertx = vertx;
+    this.key = ByteString.copyFromUtf8(name);
     this.timeout = timeout;
     this.sharedLease = sharedLease;
-    kvStub = KVGrpc.newBlockingStub(channel);
-    watchStub = WatchGrpc.newStub(channel);
+    kvStub = KVGrpc.newVertxStub(channel);
+    watchStub = WatchGrpc.newVertxStub(channel);
   }
 
   public void aquire(Handler<AsyncResult<Lock>> handler) {
     this.handler = handler;
-    startTimeout();
+    state = State.WAITING;
+    startTimer();
     tryAquire();
   }
 
   @Override
   public void release() {
-    getContext().executeBlocking(future ->
-      kvStub.deleteRange(
-        DeleteRangeRequest.newBuilder()
-          .setKey(key).build())
-    , taskQueue, (ar) -> {});
+    checkState(state == State.LOCKED);
+    kvStub.deleteRange(
+      DeleteRangeRequest.newBuilder()
+        .setKey(key)
+        .build(), (ar) -> {});
   }
 
   private void tryAquire() {
-    getContext().<Boolean>executeBlocking(future -> {
-      TxnResponse txnRes = kvStub.txn(
+    Future.<TxnResponse>future(fut ->
+      kvStub.txn(
         TxnRequest.newBuilder()
           .addCompare(Compare.newBuilder()
             .setKey(key)
@@ -94,107 +95,80 @@ public class LockImpl implements Lock {
               .setValue(ByteString.EMPTY)
               .setLease(sharedLease))
           )
-          .build());
-      future.complete(txnRes.getSucceeded());
-    }, taskQueue, (ar) -> {
-      if (ar.failed()) {
-        failImmediately(ar.cause());
-      }
-      if (ar.result()) {
-        cancelTimeout();
-        handler.handle(Future.succeededFuture(this));
-      } else {
-        startWatch();
-      }
+          .build(), fut)
+      )
+      .setHandler(ar -> {
+        if (ar.failed()) {
+          triggerFailed(ar.cause());
+          return;
+        }
+        if (ar.result().getSucceeded()) {
+          triggerLocked();
+        } else {
+          startWatching();
+        }
+      });
+  }
+
+  private void startWatching() {
+    watchStub.watch(newExchange -> {
+      if (state != State.WAITING) return;
+      exchange = newExchange;
+      exchange.write(WatchRequest.newBuilder()
+        .setCreateRequest(WatchCreateRequest.newBuilder().setKey(key))
+        .build());
+      exchange.handler(watchRes -> {
+        if (state != State.WAITING) return;
+        if (watchRes.getCreated()) {
+          watcherId = watchRes.getWatchId();
+          return;
+        }
+        if (!watchRes.getEventsList().stream().anyMatch((
+            event -> event.getType() == Event.EventType.DELETE))) {
+          return;
+        }
+        tryAquire();
+      });
     });
   }
 
-  private void startWatch() {
-    getContext().<StreamObserver<WatchRequest>>executeBlocking(future -> {
-      StreamObserver<WatchRequest> watcher = watchStub.watch(new Observer());
-      watcher.onNext(
-        WatchRequest.newBuilder()
-          .setCreateRequest(WatchCreateRequest.newBuilder().setKey(key))
-          .build());
-      future.complete(watcher);
-    }, taskQueue, ar -> {
-      if (ar.failed()) {
-        return;
-      }
-      watcher = ar.result();
-    });
+  private void startTimer() {
+    timerId = vertx.setTimer(timeout,
+      (ignore) -> triggerFailed(
+        new VertxException("Lock aquire timeout:" + key.toStringUtf8())));
   }
 
-  private void cancelWatch() {
-    if (watcher == null) {
+  private void triggerLocked() {
+    if (state != State.WAITING) {
       return;
     }
-    getContext().executeBlocking(future -> {
-      watcher.onNext(WatchRequest.newBuilder()
-        .setCancelRequest(
-          WatchCancelRequest.newBuilder()
-            .setWatchId(watchId)
-        )
-        .build());
-      future.complete();
-    }, taskQueue, ar -> watcher = null);
+    cleanup();
+    state = State.LOCKED;
+    handler.handle(Future.succeededFuture(this));
+    exchange.end();
   }
 
-  private void startTimeout() {
-    timeoutTimer = vertx.setTimer(timeout,
-      (ignore) -> triggerTimeout());
-  }
-
-  private void cancelTimeout() {
-    if (timeoutTimer != -1) {
-      vertx.cancelTimer(timeoutTimer);
-    }
-    timeoutTimer = -1;
-  }
-
-  private void triggerTimeout() {
-    failImmediately(new VertxException("Lock aquire timeout:" + key.toStringUtf8()));
-  }
-
-  private void failImmediately(Throwable t) {
-    //TODO make it chain with callback
-    cancelWatch();
-    cancelTimeout();
+  private void triggerFailed(Throwable t) {
+    cleanup();
+    state = State.FAILED;
     handler.handle(Future.failedFuture(t));
   }
 
-  private ContextImpl getContext() {
-    return (ContextImpl)vertx.getOrCreateContext();
+  private void cleanup() {
+    if (timerId != null) {
+      vertx.cancelTimer(timerId);
+    }
+    timerId = null;
+    if (watcherId != null) {
+      exchange.write(WatchRequest.newBuilder()
+        .setCancelRequest(WatchCancelRequest.newBuilder()
+          .setWatchId(watcherId))
+        .build()).end();
+    }
   }
 
-  private class Observer implements StreamObserver<WatchResponse> {
-
-    @Override
-    public void onNext(WatchResponse watchRes) {
-      getContext().runOnContext((ignore) -> {
-        if (watchRes.getCanceled()) {
-          return;
-        }
-        if (watchRes.getCreated()) {
-          watchId = watchRes.getWatchId();
-          return;
-        }
-        if (watchRes.getEvents(0).getType() != Event.EventType.DELETE) {
-          return;
-        }
-        cancelWatch();
-        tryAquire();
-      });
-    }
-
-    @Override
-    public void onError(Throwable t) {
-      getContext().runOnContext(ignore -> failImmediately(t));
-    }
-
-    @Override
-    public void onCompleted() {}
-
+  private enum State {
+    NEW, LOCKED, WAITING, FAILED
   }
 
 }

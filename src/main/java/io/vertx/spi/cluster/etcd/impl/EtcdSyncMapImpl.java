@@ -1,36 +1,34 @@
 package io.vertx.spi.cluster.etcd.impl;
 
-import com.google.common.collect.Maps;
-import com.google.protobuf.ByteString;
+import static io.vertx.spi.cluster.etcd.impl.Codec.fromByteString;
+import static io.vertx.spi.cluster.etcd.impl.Codec.toByteString;
+import static java.util.stream.Collectors.toSet;
+
+import java.util.Collection;
+import java.util.Map;
+import java.util.Set;
 
 import com.coreos.jetcd.api.DeleteRangeRequest;
 import com.coreos.jetcd.api.KVGrpc;
 import com.coreos.jetcd.api.PutRequest;
 import com.coreos.jetcd.api.RangeRequest;
-
-import java.util.Collection;
-import java.util.Map;
-import java.util.Set;
-import java.util.stream.Collectors;
+import com.google.common.collect.Maps;
 
 import io.grpc.ManagedChannel;
-
-import static io.vertx.spi.cluster.etcd.impl.Codec.fromByteString;
-import static io.vertx.spi.cluster.etcd.impl.Codec.toByteString;
 
 /**
  * @author <a href="mailto:guoyu.511@gmail.com">Guo Yu</a>
  */
 public class EtcdSyncMapImpl<K, V> implements Map<K, V> {
 
-  private String name;
+  private KeyPath keyPath;
 
   private long sharedLease;
 
   private KVGrpc.KVBlockingStub kvStub;
 
-  public EtcdSyncMapImpl(String name, long sharedLease, ManagedChannel channel) {
-    this.name = name;
+  public EtcdSyncMapImpl(KeyPath keyPath, long sharedLease, ManagedChannel channel) {
+    this.keyPath = keyPath;
     this.sharedLease = sharedLease;
     kvStub = KVGrpc.newBlockingStub(channel);
   }
@@ -39,8 +37,8 @@ public class EtcdSyncMapImpl<K, V> implements Map<K, V> {
   public int size() {
     return (int) kvStub.range(
       RangeRequest.newBuilder()
-        .setKey(ByteString.copyFromUtf8(name + "/"))
-        .setRangeEnd(ByteString.copyFromUtf8(name + "0"))
+        .setKey(keyPath.rangeBegin())
+        .setRangeEnd(keyPath.rangeEnd())
         .build())
       .getCount();
   }
@@ -49,8 +47,8 @@ public class EtcdSyncMapImpl<K, V> implements Map<K, V> {
   public boolean isEmpty() {
     return kvStub.range(
       RangeRequest.newBuilder()
-        .setKey(ByteString.copyFromUtf8(name + "/"))
-        .setRangeEnd(ByteString.copyFromUtf8(name + "0"))
+        .setKey(keyPath.rangeBegin())
+        .setRangeEnd(keyPath.rangeEnd())
         .build())
       .getCount() == 0;
   }
@@ -59,7 +57,7 @@ public class EtcdSyncMapImpl<K, V> implements Map<K, V> {
   public boolean containsKey(Object key) {
     return kvStub.range(
       RangeRequest.newBuilder()
-        .setKey(ByteString.copyFromUtf8(name + "/" + key.toString()))
+        .setKey(keyPath.getKey(key.toString())) //TODO make it type safe
         .build())
       .getCount() == 0;
   }
@@ -68,8 +66,8 @@ public class EtcdSyncMapImpl<K, V> implements Map<K, V> {
   public boolean containsValue(Object value) {
     return kvStub.range(
       RangeRequest.newBuilder()
-        .setKey(ByteString.copyFromUtf8(name + "/"))
-        .setRangeEnd(ByteString.copyFromUtf8(name + "0"))
+        .setKey(keyPath.rangeBegin())
+        .setRangeEnd(keyPath.rangeEnd())
         .build())
       .getKvsList()
       .stream()
@@ -82,7 +80,7 @@ public class EtcdSyncMapImpl<K, V> implements Map<K, V> {
   public V get(Object key) {
     return kvStub.range(
       RangeRequest.newBuilder()
-        .setKey(ByteString.copyFromUtf8(name + "/"))
+        .setKey(keyPath.getKey(key))
         .build())
       .getKvsList()
       .stream()
@@ -95,7 +93,7 @@ public class EtcdSyncMapImpl<K, V> implements Map<K, V> {
   public V put(K key, V value) {
     return fromByteString(kvStub.put(
       PutRequest.newBuilder()
-        .setKey(ByteString.copyFromUtf8(name + "/" + key.toString()))
+        .setKey(keyPath.getKey(key))
         .setValue(toByteString(value))
         .setLease(sharedLease)
         .setPrevKv(true)
@@ -107,7 +105,7 @@ public class EtcdSyncMapImpl<K, V> implements Map<K, V> {
   public V remove(Object key) {
     return kvStub.deleteRange(
       DeleteRangeRequest.newBuilder()
-        .setKey(ByteString.copyFromUtf8(name + "/" + key.toString()))
+        .setKey(keyPath.getKey(key))
         .setPrevKv(true)
         .build())
       .getPrevKvsList()
@@ -126,51 +124,41 @@ public class EtcdSyncMapImpl<K, V> implements Map<K, V> {
   public void clear() {
     kvStub.deleteRange(
       DeleteRangeRequest.newBuilder()
-        .setKey(ByteString.copyFromUtf8(name + "/"))
-        .setRangeEnd(ByteString.copyFromUtf8(name + "0"))
+        .setKey(keyPath.rangeBegin())
+        .setRangeEnd(keyPath.rangeEnd())
         .build());
   }
 
   @Override
   public Set<K> keySet() {
-    return kvStub.range(
-      RangeRequest.newBuilder()
-        .setKey(ByteString.copyFromUtf8(name + "/"))
-        .setRangeEnd(ByteString.copyFromUtf8(name + "0"))
-        .build())
-      .getKvsList()
+    return entrySet()
       .stream()
-      .<K>map(kv -> fromByteString(kv.getKey()))
-      .collect(Collectors.toSet());
+      .map(Map.Entry::getKey)
+      .collect(toSet());
   }
 
   @Override
   public Collection<V> values() {
-    return kvStub.range(
-      RangeRequest.newBuilder()
-        .setKey(ByteString.copyFromUtf8(name + "/"))
-        .setRangeEnd(ByteString.copyFromUtf8(name + "0"))
-        .build())
-      .getKvsList()
+    return entrySet()
       .stream()
-      .<V>map(kv -> fromByteString(kv.getValue()))
-      .collect(Collectors.toSet());
+      .map(Map.Entry::getValue)
+      .collect(toSet());
   }
 
   @Override
   public Set<Entry<K, V>> entrySet() {
     return kvStub.range(
       RangeRequest.newBuilder()
-        .setKey(ByteString.copyFromUtf8(name + "/"))
-        .setRangeEnd(ByteString.copyFromUtf8(name + "0"))
+        .setKey(keyPath.rangeBegin())
+        .setRangeEnd(keyPath.rangeEnd())
         .build())
       .getKvsList()
       .stream()
       .<Entry<K, V>>map(kv -> Maps.immutableEntry(
-        fromByteString(kv.getKey()),
+        keyPath.getRawKey(kv.getKey()),
         fromByteString(kv.getValue())
       ))
-      .collect(Collectors.toSet());
+      .collect(toSet());
   }
 
 }

@@ -1,5 +1,7 @@
 package io.vertx.test.core;
 
+import static io.vertx.test.core.TestCleaner.clear;
+
 import io.vertx.core.spi.cluster.ClusterManager;
 import io.vertx.spi.cluster.etcd.EtcdClusterManager;
 
@@ -9,8 +11,14 @@ import io.vertx.spi.cluster.etcd.EtcdClusterManager;
 public class EtcdAsynchronousLockTest extends ClusteredAsynchronousLockTest {
 
   @Override
+  public void setUp() throws Exception {
+    clear();
+    super.setUp();
+  }
+
+  @Override
   protected ClusterManager getClusterManager() {
-    return new EtcdClusterManager("127.0.0.1", 2379, "test-vertx-cluster");
+    return new EtcdClusterManager("localhost", 2379, "test-vertx-cluster");
   }
 
 }

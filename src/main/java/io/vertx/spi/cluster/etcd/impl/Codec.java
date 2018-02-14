@@ -1,7 +1,5 @@
 package io.vertx.spi.cluster.etcd.impl;
 
-import com.google.protobuf.ByteString;
-
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.DataInputStream;
@@ -13,6 +11,8 @@ import java.io.ObjectOutput;
 import java.io.ObjectOutputStream;
 import java.lang.reflect.Constructor;
 
+import com.google.protobuf.ByteString;
+
 import io.vertx.core.VertxException;
 import io.vertx.core.buffer.Buffer;
 import io.vertx.core.shareddata.impl.ClusterSerializable;
@@ -20,11 +20,11 @@ import io.vertx.core.shareddata.impl.ClusterSerializable;
 /**
  * @author <a href="mailto:guoyu.511@gmail.com">Guo Yu</a>
  */
-class Codec {
+public class Codec {
 
-  static ByteString toByteString(Object object) {
+  public static byte[] toByteArray(Object object) {
     if (object == null) {
-      return ByteString.EMPTY;
+      return new byte[0];
     }
     try {
       ByteArrayOutputStream byteOut = new ByteArrayOutputStream();
@@ -45,18 +45,22 @@ class Codec {
         objectOutput.writeObject(object);
         dataOutput.write(javaByteOut.toByteArray());
       }
-      return ByteString.copyFrom(byteOut.toByteArray());
+      return byteOut.toByteArray();
     } catch (IOException e) {
       throw new VertxException(e);
     }
   }
 
-  static <T> T fromByteString(ByteString bytes) {
-    if (bytes.equals(ByteString.EMPTY)) {
+  public static ByteString toByteString(Object object) {
+    return ByteString.copyFrom(toByteArray(object));
+  }
+
+  public static <T> T fromByteArray(byte[] bytes) {
+    if (bytes.length == 0) {
       return null;
     }
     try {
-      ByteArrayInputStream byteIn = new ByteArrayInputStream(bytes.toByteArray());
+      ByteArrayInputStream byteIn = new ByteArrayInputStream(bytes);
       DataInputStream in = new DataInputStream(byteIn);
       boolean isClusterSerializable = in.readBoolean();
       if (isClusterSerializable) {
@@ -88,5 +92,9 @@ class Codec {
     } catch (IOException | ClassNotFoundException e) {
       throw new VertxException(e);
     }
+  }
+
+  public static <T> T fromByteString(ByteString bytes) {
+    return fromByteArray(bytes.toByteArray());
   }
 }

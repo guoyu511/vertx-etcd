@@ -1,6 +1,8 @@
 package io.vertx.spi.cluster.etcd.impl;
 
-import com.google.protobuf.ByteString;
+import static io.vertx.spi.cluster.etcd.impl.Codec.toByteString;
+
+import javax.annotation.Nonnull;
 
 import com.coreos.jetcd.api.Compare;
 import com.coreos.jetcd.api.DeleteRangeRequest;
@@ -11,136 +13,95 @@ import com.coreos.jetcd.api.RangeResponse;
 import com.coreos.jetcd.api.RequestOp;
 import com.coreos.jetcd.api.TxnRequest;
 import com.coreos.jetcd.api.TxnResponse;
-
-import java.util.Objects;
+import com.google.protobuf.ByteString;
 
 import io.grpc.ManagedChannel;
 import io.vertx.core.AsyncResult;
 import io.vertx.core.Future;
 import io.vertx.core.Handler;
-import io.vertx.core.Vertx;
 import io.vertx.core.shareddata.Counter;
-
-import static io.vertx.spi.cluster.etcd.impl.Codec.fromByteString;
-import static io.vertx.spi.cluster.etcd.impl.Codec.toByteString;
 
 /**
  * @author <a href="mailto:guoyu.511@gmail.com">Guo Yu</a>
  */
 public class CounterImpl implements Counter {
 
-  private Vertx vertx;
-
   private ByteString key;
 
-  private KVGrpc.KVBlockingStub kvStub;
+  private KVGrpc.KVVertxStub kvStub;
 
   private long sharedLease;
 
-  public CounterImpl(String name, long sharedLease, ManagedChannel channel, Vertx vertx) {
-    this.vertx = vertx;
+  public CounterImpl(String name, long sharedLease, ManagedChannel channel) {
     this.sharedLease = sharedLease;
     this.key = ByteString.copyFromUtf8(name);
-    kvStub = KVGrpc.newBlockingStub(channel);
+    kvStub = KVGrpc.newVertxStub(channel);
   }
 
   @Override
-  public void get(Handler<AsyncResult<Long>> resultHandler) {
-    Objects.requireNonNull(resultHandler);
-    vertx.executeBlocking(future -> {
-      RangeResponse rangeRes = kvStub.range(RangeRequest.newBuilder()
+  public void get(@Nonnull Handler<AsyncResult<Long>> handler) {
+    Future.<RangeResponse>future(fut ->
+      kvStub.range(RangeRequest.newBuilder()
         .setKey(key)
-        .build());
-      if (rangeRes.getKvsCount() == 0) {
-        future.complete(0l);
-      } else {
-        future.complete(
-          fromByteString(rangeRes.getKvs(0).getValue())
-        );
-      }
-    }, false, resultHandler);
+        .build(), fut))
+      .map(res ->
+        res.getKvsCount() > 0
+          ? Codec.fromByteString(res.getKvs(0).getValue())
+          : 0L
+      )
+      .setHandler(handler);
   }
 
   @Override
-  public void incrementAndGet(Handler<AsyncResult<Long>> resultHandler) {
-    addAndGet(1, resultHandler);
+  public void incrementAndGet(@Nonnull Handler<AsyncResult<Long>> handler) {
+    addAndGet(1, handler);
   }
 
   @Override
-  public void getAndIncrement(Handler<AsyncResult<Long>> resultHandler) {
-    getAndAdd(1, resultHandler);
+  public void getAndIncrement(@Nonnull Handler<AsyncResult<Long>> handler) {
+    getAndAdd(1, handler);
   }
 
   @Override
-  public void decrementAndGet(Handler<AsyncResult<Long>> resultHandler) {
-    addAndGet(-1, resultHandler);
+  public void decrementAndGet(@Nonnull Handler<AsyncResult<Long>> handler) {
+    addAndGet(-1, handler);
   }
 
   @Override
-  public void addAndGet(long value, Handler<AsyncResult<Long>> resultHandler) {
-    Objects.requireNonNull(resultHandler);
-    vertx.<Long>executeBlocking(future -> {
-      RangeResponse rangeRes = kvStub.range(RangeRequest.newBuilder()
-        .setKey(key)
-        .build());
-      if (rangeRes.getKvsCount() == 0) {
-        future.complete(0l);
-      } else {
-        future.complete(fromByteString(rangeRes.getKvs(0).getValue()));
-      }
-    }, false, (ar) -> {
-      if (ar.failed()) {
-        resultHandler.handle(Future.failedFuture(ar.cause()));
-        return;
-      }
-      long expected = ar.result();
-      long newValue = expected + value;
-      compareAndSet(expected, newValue, (casRes) -> {
-        if (casRes.failed()) {
-          resultHandler.handle(Future.failedFuture(ar.cause()));
-        } else if (casRes.result()) {
-          resultHandler.handle(casRes.map(newValue));
+  public void addAndGet(long increment, @Nonnull Handler<AsyncResult<Long>> handler) {
+    Future.<Long>future(this::get)
+      .compose(oldVal -> {
+        long newVal = oldVal + increment;
+        return Future.<Boolean>future(fut -> compareAndSet(oldVal, newVal, fut))
+          .compose(casRes -> {
+            if (casRes) {
+              return Future.succeededFuture(newVal);
+            } else {
+              return Future.future(fut -> addAndGet(increment, fut));
+            }
+          });
+      })
+      .setHandler(handler);
+  }
+
+  @Override
+  public void getAndAdd(long value, @Nonnull Handler<AsyncResult<Long>> handler) {
+    Future.<Long>future(this::get)
+      .compose(expected -> Future.<Boolean>future(fut ->
+        compareAndSet(expected, value, fut)))
+      .compose(casRes -> {
+        if (casRes) {
+          return Future.succeededFuture(value);
         } else {
-          getAndAdd(value, resultHandler);
+          return Future.future(fut -> addAndGet(value, fut));
         }
-      });
-    });
+      })
+      .setHandler(handler);
   }
 
   @Override
-  public void getAndAdd(long value, Handler<AsyncResult<Long>> resultHandler) {
-    Objects.requireNonNull(resultHandler);
-    vertx.<Long>executeBlocking(future -> {
-      RangeResponse rangeRes = kvStub.range(RangeRequest.newBuilder()
-        .setKey(key)
-        .build());
-      if (rangeRes.getKvsCount() == 0) {
-        future.complete(0l);
-      } else {
-        future.complete(fromByteString(rangeRes.getKvs(0).getValue()));
-      }
-    }, false, (ar) -> {
-      if (ar.failed()) {
-        resultHandler.handle(Future.failedFuture(ar.cause()));
-        return;
-      }
-      long expected = ar.result();
-      long newValue = expected + value;
-      compareAndSet(expected, newValue, (casRes) -> {
-        if (casRes.failed()) {
-          resultHandler.handle(Future.failedFuture(ar.cause()));
-        } else if (casRes.result()) {
-          resultHandler.handle(casRes.map(expected));
-        } else {
-          getAndAdd(value, resultHandler);
-        }
-      });
-    });
-  }
-
-  @Override
-  public void compareAndSet(long expected, long value, Handler<AsyncResult<Boolean>> resultHandler) {
-    Objects.requireNonNull(resultHandler);
+  public void compareAndSet(long expected, long value,
+                            @Nonnull Handler<AsyncResult<Boolean>> handler) {
     Compare.Builder compare = expected == 0 ?
       Compare.newBuilder()
         .setKey(key)
@@ -169,17 +130,16 @@ public class CounterImpl implements Counter {
           .build()
       );
     }
-    vertx.executeBlocking(future -> {
-      TxnResponse txnRes = kvStub.txn(
-        TxnRequest.newBuilder()
+    Future.<TxnResponse>future(fut ->
+      kvStub.txn(TxnRequest.newBuilder()
           .addCompare(compare)
           .addSuccess(successOp)
           .addFailure(RequestOp.newBuilder()
             .setRequestRange(RangeRequest.newBuilder().setKey(key))
           )
-          .build());
-      future.complete(txnRes.getSucceeded());
-    }, false, resultHandler);
+          .build(), fut))
+      .map(TxnResponse::getSucceeded)
+      .setHandler(handler);
   }
 
 }
